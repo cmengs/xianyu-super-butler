@@ -751,6 +751,9 @@ class XianyuLive:
         self.message_debounce_tasks = {}  # 存储每个chat_id的防抖任务
         self.message_debounce_delay = 1  # 防抖延迟时间（秒）：用户停止发送消息1秒后才回复
         self.message_debounce_lock = asyncio.Lock()  # 防抖任务管理的锁
+
+        # 等待 MessageSend RPC 的服务端响应，避免把“写入 WebSocket”误判为送达成功。
+        self.pending_send_responses = {}
         
         # 消息去重机制：防止同一条消息被处理多次
         self.processed_message_ids = {}  # 存储已处理的消息ID和时间戳 {message_id: timestamp}
@@ -5836,6 +5839,10 @@ class XianyuLive:
 
     async def send_msg(self, ws, cid, toid, text):
         text_content = str(text or '').strip()
+        if not text_content:
+            raise ValueError("消息内容不能为空")
+
+        message_mid = generate_mid()
         text = {
             "contentType": 1,
             "text": {
@@ -5846,7 +5853,7 @@ class XianyuLive:
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {
-                "mid": generate_mid()
+                "mid": message_mid
             },
             "body": [
                 {
@@ -5879,20 +5886,61 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
-        if text_content:
+        loop = asyncio.get_running_loop()
+        response_future = loop.create_future()
+        self.pending_send_responses[message_mid] = response_future
+        try:
+            await asyncio.wait_for(ws.send(json.dumps(msg)), timeout=2.0)
+            response = await asyncio.wait_for(response_future, timeout=5.0)
+            response_code = response.get("code") if isinstance(response, dict) else None
             try:
-                from db_manager import db_manager
-                db_manager.save_chat_message(
-                    cookie_id=self.cookie_id,
-                    chat_id=cid,
-                    user_id=toid,
-                    role='seller',
-                    content=text_content,
-                    source='outgoing',
-                )
-            except Exception as e:
-                logger.warning(f"【{self.cookie_id}】保存发出消息失败: {self._safe_str(e)}")
+                response_code = int(response_code)
+            except (TypeError, ValueError):
+                response_code = 0
+
+            if response_code != 200:
+                response_body = response.get("body") if isinstance(response, dict) else response
+                detail = self._safe_str(response_body)
+                if len(detail) > 300:
+                    detail = detail[:300] + "..."
+                raise RuntimeError(f"闲鱼拒绝发送消息（code={response_code}）：{detail}")
+
+            from db_manager import db_manager
+            db_manager.save_chat_message(
+                cookie_id=self.cookie_id,
+                chat_id=cid,
+                user_id=toid,
+                role='seller',
+                content=text_content,
+                source='outgoing_confirmed',
+            )
+            logger.info(
+                f"【{self.cookie_id}】闲鱼确认消息发送成功: "
+                f"chat={cid}, user={toid}, mid={message_mid}"
+            )
+            return response
+        except asyncio.TimeoutError as e:
+            raise RuntimeError("等待闲鱼确认消息发送超时，请检查账号连接后重试") from e
+        finally:
+            self.pending_send_responses.pop(message_mid, None)
+
+    def _resolve_pending_send_response(self, message_data) -> bool:
+        """将 MessageSend RPC 响应交回对应的发送请求。"""
+        if not isinstance(message_data, dict):
+            return False
+        headers = message_data.get("headers")
+        if not isinstance(headers, dict):
+            return False
+        message_mid = str(headers.get("mid") or "").strip()
+        if not message_mid:
+            return False
+
+        response_future = self.pending_send_responses.get(message_mid)
+        if not response_future:
+            return False
+        if not response_future.done():
+            response_future.set_result(message_data)
+        return True
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -8911,6 +8959,10 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】收到WebSocket消息: {len(message) if message else 0} 字节")
                                 try:
                                     message_data = json.loads(message)
+
+                                    # 发送消息的 RPC 响应也是 code=200，必须先于心跳响应处理。
+                                    if self._resolve_pending_send_response(message_data):
+                                        continue
 
                                     # 处理心跳响应
                                     if await self.handle_heartbeat_response(message_data):

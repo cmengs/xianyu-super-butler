@@ -6010,6 +6010,11 @@ async def send_user_chat_message(
         conversation = db_manager.get_chat_conversation(cookie_id, chat_id)
         if not conversation or not conversation.get('user_id'):
             raise HTTPException(status_code=404, detail="未找到聊天对象")
+        if not conversation.get('verified'):
+            raise HTTPException(
+                status_code=409,
+                detail="该记录来自历史订单，不是真实聊天会话；请在买家发来消息后回复",
+            )
 
         from XianyuAutoAsync import XianyuLive
         live_instance = XianyuLive.get_instance(cookie_id)
@@ -6026,12 +6031,12 @@ async def send_user_chat_message(
         )
         log_with_user(
             'info',
-            f"聊天消息发送成功: cookie={cookie_id}, chat={chat_id}, user={conversation['user_id']}",
+            f"聊天消息已获闲鱼确认: cookie={cookie_id}, chat={chat_id}, user={conversation['user_id']}",
             current_user,
         )
         return {
             "success": True,
-            "message": "消息发送成功",
+            "message": "消息已获闲鱼确认",
             "data": {
                 "cookie_id": cookie_id,
                 "chat_id": chat_id,

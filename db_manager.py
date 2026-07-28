@@ -348,30 +348,6 @@ class DBManager:
             )
             ''')
 
-            # 已有订单即使没有 AI 对话，也应能在聊天页主动联系买家。
-            cursor.execute('''
-            INSERT OR IGNORE INTO chat_conversations (
-                cookie_id, chat_id, user_id, user_name, item_id,
-                last_message, last_role, last_message_at
-            )
-            SELECT
-                cookie_id,
-                chat_id,
-                COALESCE(buyer_id, ''),
-                COALESCE(buyer_nick, ''),
-                COALESCE(item_id, ''),
-                '',
-                'system',
-                COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
-            FROM orders
-            WHERE cookie_id IS NOT NULL
-              AND cookie_id != ''
-              AND chat_id IS NOT NULL
-              AND chat_id != ''
-              AND buyer_id IS NOT NULL
-              AND buyer_id != ''
-            ''')
-
             # 检查并添加 is_bargain 列（用于标记小刀订单）
             try:
                 self._execute_sql(cursor, "SELECT is_bargain FROM orders LIMIT 1")
@@ -2431,7 +2407,7 @@ class DBManager:
                     if existing:
                         return existing[0]
 
-                # send_msg 会先保存本地记录，闲鱼随后回显同一条消息。
+                # 兼容升级前由 send_msg 先保存、闲鱼随后回显的本地记录。
                 if role == 'seller' and external_message_id:
                     cursor.execute('''
                         SELECT id FROM chat_messages
@@ -2522,6 +2498,21 @@ class DBManager:
                         conversation.user_name
                     FROM chat_conversations conversation
                     WHERE conversation.cookie_id IN ({placeholders})
+                      AND EXISTS (
+                          SELECT 1
+                          FROM chat_messages verified
+                          WHERE verified.cookie_id = conversation.cookie_id
+                            AND verified.chat_id = conversation.chat_id
+                            AND (
+                                verified.external_message_id IS NOT NULL
+                                OR verified.source IN (
+                                    'xianyu',
+                                    'xianyu_echo',
+                                    'ai_history',
+                                    'outgoing_confirmed'
+                                )
+                            )
+                      )
                     ORDER BY conversation.last_message_at DESC
                     LIMIT ?
                 ''', (*safe_cookie_ids, max(1, min(int(limit or 100), 500))))
@@ -2635,9 +2626,27 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    SELECT user_id, user_name, item_id
-                    FROM chat_conversations
-                    WHERE cookie_id = ? AND chat_id = ?
+                    SELECT
+                        conversation.user_id,
+                        conversation.user_name,
+                        conversation.item_id,
+                        EXISTS (
+                            SELECT 1
+                            FROM chat_messages verified
+                            WHERE verified.cookie_id = conversation.cookie_id
+                              AND verified.chat_id = conversation.chat_id
+                              AND (
+                                  verified.external_message_id IS NOT NULL
+                                  OR verified.source IN (
+                                      'xianyu',
+                                      'xianyu_echo',
+                                      'ai_history',
+                                      'outgoing_confirmed'
+                                  )
+                              )
+                        ) AS verified
+                    FROM chat_conversations conversation
+                    WHERE conversation.cookie_id = ? AND conversation.chat_id = ?
                     LIMIT 1
                 ''', (cookie_id, chat_id))
                 row = cursor.fetchone()
@@ -2647,6 +2656,7 @@ class DBManager:
                     'user_id': row[0] or '',
                     'user_name': row[1] or '',
                     'item_id': row[2] or '',
+                    'verified': bool(row[3]),
                 }
             except Exception as e:
                 logger.error(f"获取聊天会话信息失败: {e}")
