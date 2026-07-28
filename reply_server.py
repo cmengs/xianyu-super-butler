@@ -5772,7 +5772,7 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
         # 验证表名安全性
         allowed_tables = [
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
-            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'ai_reply_settings', 'ai_conversations', 'chat_conversations', 'chat_messages', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', "item_replay",
             'risk_control_logs'
@@ -5810,7 +5810,7 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
         # 验证表名安全性
         allowed_tables = [
             'users', 'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
-            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'ai_reply_settings', 'ai_conversations', 'chat_messages', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders','item_replay'
         ]
@@ -5850,7 +5850,7 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
         # 验证表名安全性
         allowed_tables = [
             'cookies', 'cookie_status', 'keywords', 'default_replies', 'default_reply_records',
-            'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'item_info',
+            'ai_reply_settings', 'ai_conversations', 'chat_conversations', 'chat_messages', 'ai_item_cache', 'item_info',
             'message_notifications', 'cards', 'delivery_rules', 'notification_channels',
             'user_settings', 'system_settings', 'email_verifications', 'captcha_codes', 'orders', 'item_replay',
             'risk_control_logs'
@@ -5923,6 +5923,127 @@ def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_d
 
 
 
+
+
+# ==================== 聊天管理接口 ====================
+
+@app.get('/api/chats')
+def get_user_chats(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    cookie_id: Optional[str] = Query(None, description="闲鱼账号ID"),
+    search: Optional[str] = Query(None, description="搜索买家、商品或消息"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """获取当前后台用户拥有账号的聊天会话。"""
+    try:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id:
+            if cookie_id not in user_cookies:
+                raise HTTPException(status_code=403, detail="无权查看此账号的聊天")
+            cookie_ids = [cookie_id]
+        else:
+            cookie_ids = list(user_cookies.keys())
+
+        conversations = db_manager.get_chat_conversations(
+            cookie_ids=cookie_ids,
+            search=search or '',
+            limit=limit,
+        )
+        return {
+            "success": True,
+            "data": conversations,
+            "total": len(conversations),
+            "unread_total": sum(item.get('unread_count', 0) for item in conversations),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询聊天会话失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询聊天会话失败: {str(e)}")
+
+
+@app.get('/api/chats/{chat_id}/messages')
+def get_user_chat_messages(
+    chat_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    cookie_id: str = Query(..., description="闲鱼账号ID"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """获取单个会话的聊天记录，并标记为已读。"""
+    try:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权查看此账号的聊天")
+        if not db_manager.get_chat_conversation(cookie_id, chat_id):
+            raise HTTPException(status_code=404, detail="聊天会话不存在")
+
+        messages = db_manager.get_chat_messages(cookie_id, chat_id, limit)
+        return {"success": True, "data": messages}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"查询聊天记录失败: {chat_id} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询聊天记录失败: {str(e)}")
+
+
+@app.post('/api/chats/{chat_id}/messages')
+async def send_user_chat_message(
+    chat_id: str,
+    message_data: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """通过账号当前在线的闲鱼 WebSocket 发送文本消息。"""
+    try:
+        cookie_id = str(message_data.get('cookie_id') or '').strip()
+        content = str(message_data.get('content') or '').strip()
+        if not cookie_id:
+            raise HTTPException(status_code=400, detail="请选择闲鱼账号")
+        if not content:
+            raise HTTPException(status_code=400, detail="消息内容不能为空")
+        if len(content) > 2000:
+            raise HTTPException(status_code=400, detail="消息内容不能超过 2000 个字符")
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权使用此账号发送消息")
+
+        conversation = db_manager.get_chat_conversation(cookie_id, chat_id)
+        if not conversation or not conversation.get('user_id'):
+            raise HTTPException(status_code=404, detail="未找到聊天对象")
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if not live_instance:
+            raise HTTPException(status_code=409, detail="该闲鱼账号当前未连接")
+        if not live_instance.ws or live_instance.ws.closed:
+            raise HTTPException(status_code=409, detail="该闲鱼账号连接已断开，请等待重连")
+
+        await live_instance.send_msg(
+            live_instance.ws,
+            chat_id,
+            conversation['user_id'],
+            content,
+        )
+        log_with_user(
+            'info',
+            f"聊天消息发送成功: cookie={cookie_id}, chat={chat_id}, user={conversation['user_id']}",
+            current_user,
+        )
+        return {
+            "success": True,
+            "message": "消息发送成功",
+            "data": {
+                "cookie_id": cookie_id,
+                "chat_id": chat_id,
+                "user_id": conversation['user_id'],
+                "content": content,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"发送聊天消息失败: {chat_id} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"发送聊天消息失败: {str(e)}")
 
 
 # ==================== 订单管理接口 ====================

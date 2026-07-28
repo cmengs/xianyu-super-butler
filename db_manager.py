@@ -182,6 +182,112 @@ class DBManager:
             )
             ''')
 
+            # 创建后台聊天记录表。与 AI 对话分开，确保未启用 AI 时也能保存消息。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_conversations (
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                user_name TEXT DEFAULT '',
+                item_id TEXT DEFAULT '',
+                last_message TEXT DEFAULT '',
+                last_role TEXT DEFAULT 'system',
+                last_message_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, chat_id),
+                FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                user_name TEXT DEFAULT '',
+                item_id TEXT DEFAULT '',
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                message_type TEXT DEFAULT 'text',
+                external_message_id TEXT,
+                source TEXT DEFAULT 'xianyu',
+                is_read INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE,
+                UNIQUE(cookie_id, external_message_id)
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
+            ON chat_messages(cookie_id, chat_id, id)
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_unread
+            ON chat_messages(cookie_id, chat_id, is_read)
+            ''')
+
+            # 首次启用聊天时，用已有 AI 对话填充可用的历史记录。
+            cursor.execute("SELECT COUNT(*) FROM chat_messages")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute('''
+                INSERT INTO chat_messages (
+                    cookie_id, chat_id, user_id, item_id, role, content,
+                    message_type, source, is_read, created_at
+                )
+                SELECT
+                    cookie_id,
+                    chat_id,
+                    user_id,
+                    item_id,
+                    CASE WHEN role = 'assistant' THEN 'seller' ELSE 'buyer' END,
+                    content,
+                    'text',
+                    'ai_history',
+                    1,
+                    created_at
+                FROM ai_conversations
+                WHERE chat_id != '' AND content != ''
+                ''')
+
+            cursor.execute('''
+            INSERT INTO chat_conversations (
+                cookie_id, chat_id, user_id, user_name, item_id,
+                last_message, last_role, last_message_at
+            )
+            SELECT
+                message.cookie_id,
+                message.chat_id,
+                message.user_id,
+                message.user_name,
+                message.item_id,
+                message.content,
+                message.role,
+                message.created_at
+            FROM chat_messages message
+            JOIN (
+                SELECT cookie_id, chat_id, MAX(id) AS last_id
+                FROM chat_messages
+                GROUP BY cookie_id, chat_id
+            ) latest ON latest.last_id = message.id
+            ON CONFLICT(cookie_id, chat_id) DO UPDATE SET
+                user_id = CASE
+                    WHEN excluded.user_id != '' THEN excluded.user_id
+                    ELSE chat_conversations.user_id
+                END,
+                user_name = CASE
+                    WHEN excluded.user_name != '' THEN excluded.user_name
+                    ELSE chat_conversations.user_name
+                END,
+                item_id = CASE
+                    WHEN excluded.item_id != '' THEN excluded.item_id
+                    ELSE chat_conversations.item_id
+                END,
+                last_message = excluded.last_message,
+                last_role = excluded.last_role,
+                last_message_at = excluded.last_message_at,
+                updated_at = CURRENT_TIMESTAMP
+            ''')
+
             # 创建AI商品信息缓存表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_item_cache (
@@ -240,6 +346,30 @@ class DBManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
+            ''')
+
+            # 已有订单即使没有 AI 对话，也应能在聊天页主动联系买家。
+            cursor.execute('''
+            INSERT OR IGNORE INTO chat_conversations (
+                cookie_id, chat_id, user_id, user_name, item_id,
+                last_message, last_role, last_message_at
+            )
+            SELECT
+                cookie_id,
+                chat_id,
+                COALESCE(buyer_id, ''),
+                COALESCE(buyer_nick, ''),
+                COALESCE(item_id, ''),
+                '',
+                'system',
+                COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+            FROM orders
+            WHERE cookie_id IS NOT NULL
+              AND cookie_id != ''
+              AND chat_id IS NOT NULL
+              AND chat_id != ''
+              AND buyer_id IS NOT NULL
+              AND buyer_id != ''
             ''')
 
             # 检查并添加 is_bargain 列（用于标记小刀订单）
@@ -2228,6 +2358,300 @@ class DBManager:
             except Exception as e:
                 logger.error(f"清空默认回复记录失败: {e}")
 
+    def save_chat_message(
+        self,
+        cookie_id: str,
+        chat_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        user_name: str = '',
+        item_id: str = '',
+        message_type: str = 'text',
+        external_message_id: str = None,
+        source: str = 'xianyu',
+        created_at: str = None,
+    ) -> Optional[int]:
+        """保存聊天消息，并合并发送接口产生的本地消息与闲鱼回显。"""
+        cookie_id = str(cookie_id or '').strip()
+        chat_id = str(chat_id or '').strip()
+        user_id = str(user_id or '').strip()
+        role = str(role or '').strip()
+        content = str(content or '').strip()
+        external_message_id = str(external_message_id or '').strip() or None
+        if not cookie_id or not chat_id or not user_id or role not in ('buyer', 'seller', 'system') or not content:
+            return None
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                def upsert_conversation():
+                    cursor.execute('''
+                        INSERT INTO chat_conversations (
+                            cookie_id, chat_id, user_id, user_name, item_id,
+                            last_message, last_role, last_message_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                        ON CONFLICT(cookie_id, chat_id) DO UPDATE SET
+                            user_id = CASE
+                                WHEN excluded.user_id != '' THEN excluded.user_id
+                                ELSE chat_conversations.user_id
+                            END,
+                            user_name = CASE
+                                WHEN excluded.user_name != '' THEN excluded.user_name
+                                ELSE chat_conversations.user_name
+                            END,
+                            item_id = CASE
+                                WHEN excluded.item_id != '' THEN excluded.item_id
+                                ELSE chat_conversations.item_id
+                            END,
+                            last_message = excluded.last_message,
+                            last_role = excluded.last_role,
+                            last_message_at = excluded.last_message_at,
+                            updated_at = CURRENT_TIMESTAMP
+                    ''', (
+                        cookie_id,
+                        chat_id,
+                        user_id,
+                        str(user_name or '').strip(),
+                        str(item_id or '').strip(),
+                        content,
+                        role,
+                        created_at,
+                    ))
+
+                if external_message_id:
+                    cursor.execute('''
+                        SELECT id FROM chat_messages
+                        WHERE cookie_id = ? AND external_message_id = ?
+                        LIMIT 1
+                    ''', (cookie_id, external_message_id))
+                    existing = cursor.fetchone()
+                    if existing:
+                        return existing[0]
+
+                # send_msg 会先保存本地记录，闲鱼随后回显同一条消息。
+                if role == 'seller' and external_message_id:
+                    cursor.execute('''
+                        SELECT id FROM chat_messages
+                        WHERE cookie_id = ? AND chat_id = ? AND role = 'seller'
+                          AND content = ? AND external_message_id IS NULL
+                          AND created_at >= datetime('now', '-60 seconds')
+                        ORDER BY id DESC LIMIT 1
+                    ''', (cookie_id, chat_id, content))
+                    pending = cursor.fetchone()
+                    if pending:
+                        cursor.execute('''
+                            UPDATE chat_messages
+                            SET external_message_id = ?, source = ?, created_at = COALESCE(?, created_at)
+                            WHERE id = ?
+                        ''', (external_message_id, source, created_at, pending[0]))
+                        upsert_conversation()
+                        self.conn.commit()
+                        return pending[0]
+
+                cursor.execute('''
+                    INSERT INTO chat_messages (
+                        cookie_id, chat_id, user_id, user_name, item_id, role,
+                        content, message_type, external_message_id, source,
+                        is_read, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ''', (
+                    cookie_id,
+                    chat_id,
+                    user_id,
+                    str(user_name or '').strip(),
+                    str(item_id or '').strip(),
+                    role,
+                    content,
+                    str(message_type or 'text').strip() or 'text',
+                    external_message_id,
+                    str(source or 'xianyu').strip() or 'xianyu',
+                    0 if role == 'buyer' else 1,
+                    created_at,
+                ))
+                message_id = cursor.lastrowid
+                upsert_conversation()
+                self.conn.commit()
+                return message_id
+            except Exception as e:
+                logger.error(f"保存聊天消息失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def get_chat_conversations(
+        self,
+        cookie_ids: List[str],
+        search: str = '',
+        limit: int = 100,
+    ) -> List[Dict[str, any]]:
+        """按最后消息倒序返回账号下的会话列表。"""
+        safe_cookie_ids = [str(cookie_id) for cookie_id in cookie_ids if cookie_id]
+        if not safe_cookie_ids:
+            return []
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join('?' for _ in safe_cookie_ids)
+                cursor.execute(f'''
+                    SELECT
+                        conversation.cookie_id,
+                        conversation.chat_id,
+                        conversation.user_id,
+                        conversation.item_id,
+                        conversation.last_message,
+                        conversation.last_role,
+                        conversation.last_message_at,
+                        COALESCE((
+                            SELECT MAX(message.id)
+                            FROM chat_messages message
+                            WHERE message.cookie_id = conversation.cookie_id
+                              AND message.chat_id = conversation.chat_id
+                        ), 0) AS last_message_id,
+                        (
+                            SELECT COUNT(*)
+                            FROM chat_messages unread
+                            WHERE unread.cookie_id = conversation.cookie_id
+                              AND unread.chat_id = conversation.chat_id
+                              AND unread.role = 'buyer'
+                              AND unread.is_read = 0
+                        ) AS unread_count,
+                        conversation.user_name
+                    FROM chat_conversations conversation
+                    WHERE conversation.cookie_id IN ({placeholders})
+                    ORDER BY conversation.last_message_at DESC
+                    LIMIT ?
+                ''', (*safe_cookie_ids, max(1, min(int(limit or 100), 500))))
+                rows = cursor.fetchall()
+
+                cursor.execute(
+                    f"SELECT id, COALESCE(remark, '') FROM cookies WHERE id IN ({placeholders})",
+                    safe_cookie_ids,
+                )
+                account_names = {row[0]: row[1] for row in cursor.fetchall()}
+
+                conversations = []
+                keyword = str(search or '').strip().lower()
+                for row in rows:
+                    cookie_id = row[0]
+                    user_id = row[2] or ''
+                    item_id = row[3] or ''
+                    user_name = row[9] or ''
+                    item_title = ''
+                    item_image = ''
+                    if item_id:
+                        cursor.execute('''
+                            SELECT item_title, item_image
+                            FROM item_info
+                            WHERE cookie_id = ? AND item_id = ?
+                            ORDER BY id DESC LIMIT 1
+                        ''', (cookie_id, item_id))
+                        item_row = cursor.fetchone()
+                        if item_row:
+                            item_title = item_row[0] or ''
+                            item_image = item_row[1] or ''
+
+                    conversation = {
+                        'cookie_id': cookie_id,
+                        'account_name': account_names.get(cookie_id) or cookie_id,
+                        'chat_id': row[1],
+                        'user_id': user_id,
+                        'user_name': user_name or f'买家 {user_id}',
+                        'item_id': item_id,
+                        'item_title': item_title,
+                        'item_image': item_image,
+                        'last_message': row[4],
+                        'last_role': row[5],
+                        'last_message_at': row[6],
+                        'last_message_id': row[7],
+                        'unread_count': int(row[8] or 0),
+                    }
+                    haystack = ' '.join(str(value or '') for value in (
+                        conversation['user_name'],
+                        conversation['user_id'],
+                        conversation['chat_id'],
+                        conversation['item_title'],
+                        conversation['item_id'],
+                        conversation['last_message'],
+                    )).lower()
+                    if not keyword or keyword in haystack:
+                        conversations.append(conversation)
+                return conversations
+            except Exception as e:
+                logger.error(f"获取聊天会话失败: {e}")
+                return []
+
+    def get_chat_messages(
+        self,
+        cookie_id: str,
+        chat_id: str,
+        limit: int = 100,
+    ) -> List[Dict[str, any]]:
+        """返回单个会话消息，并将买家消息标记为已读。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT
+                        id, cookie_id, chat_id, user_id, user_name, item_id,
+                        role, content, message_type, source, created_at
+                    FROM chat_messages
+                    WHERE cookie_id = ? AND chat_id = ?
+                    ORDER BY id DESC LIMIT ?
+                ''', (cookie_id, chat_id, max(1, min(int(limit or 100), 500))))
+                rows = list(reversed(cursor.fetchall()))
+                cursor.execute('''
+                    UPDATE chat_messages
+                    SET is_read = 1
+                    WHERE cookie_id = ? AND chat_id = ? AND role = 'buyer' AND is_read = 0
+                ''', (cookie_id, chat_id))
+                self.conn.commit()
+                return [
+                    {
+                        'id': row[0],
+                        'cookie_id': row[1],
+                        'chat_id': row[2],
+                        'user_id': row[3],
+                        'user_name': row[4] or '',
+                        'item_id': row[5] or '',
+                        'role': row[6],
+                        'content': row[7],
+                        'message_type': row[8] or 'text',
+                        'source': row[9] or 'xianyu',
+                        'created_at': row[10],
+                    }
+                    for row in rows
+                ]
+            except Exception as e:
+                logger.error(f"获取聊天消息失败: {e}")
+                return []
+
+    def get_chat_conversation(self, cookie_id: str, chat_id: str) -> Optional[Dict[str, str]]:
+        """读取发送消息所需的买家和商品信息。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT user_id, user_name, item_id
+                    FROM chat_conversations
+                    WHERE cookie_id = ? AND chat_id = ?
+                    LIMIT 1
+                ''', (cookie_id, chat_id))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'user_id': row[0] or '',
+                    'user_name': row[1] or '',
+                    'item_id': row[2] or '',
+                }
+            except Exception as e:
+                logger.error(f"获取聊天会话信息失败: {e}")
+                return None
+
     def find_chat_id_by_buyer(self, cookie_id: str, buyer_id: str) -> str:
         """根据买家ID查找最近的chat_id（从AI对话记录中查找）"""
         with self.lock:
@@ -2539,7 +2963,8 @@ class DBManager:
 
                         # 备份其他相关表
                         related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations']
+                                        'item_info', 'ai_reply_settings', 'ai_conversations',
+                                        'chat_conversations', 'chat_messages']
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2555,7 +2980,8 @@ class DBManager:
                         'cookies', 'keywords', 'cookie_status', 'cards',
                         'delivery_rules', 'default_replies', 'notification_channels',
                         'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache'
+                        'ai_reply_settings', 'ai_conversations', 'chat_conversations',
+                        'chat_messages', 'ai_item_cache'
                     ]
 
                     for table in tables:
@@ -2598,7 +3024,8 @@ class DBManager:
 
                         # 删除用户相关数据
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
+                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings',
+                                        'chat_messages', 'chat_conversations']
 
                         for table in related_tables:
                             cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2610,7 +3037,8 @@ class DBManager:
                     tables = [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
+                        'chat_messages', 'chat_conversations', 'ai_conversations',
+                        'ai_reply_settings', 'ai_item_cache', 'cookies'
                     ]
 
                     for table in tables:
@@ -2625,7 +3053,8 @@ class DBManager:
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
                                         'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                                        'ai_reply_settings', 'ai_conversations', 'chat_conversations',
+                                        'chat_messages', 'ai_item_cache']:
                         continue
 
                     columns = table_data['columns']
@@ -5359,6 +5788,7 @@ class DBManager:
                     'item_replay': 'item_id',
                     'ai_reply_settings': 'id',
                     'ai_conversations': 'id',
+                    'chat_messages': 'id',
                     'ai_item_cache': 'id',
                     'item_info': 'id',
                     'message_notifications': 'id',

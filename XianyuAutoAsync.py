@@ -5835,10 +5835,11 @@ class XianyuLive:
         await ws.send(json.dumps(msg))
 
     async def send_msg(self, ws, cid, toid, text):
+        text_content = str(text or '').strip()
         text = {
             "contentType": 1,
             "text": {
-                "text": text
+                "text": text_content
             }
         }
         text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
@@ -5879,6 +5880,19 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        if text_content:
+            try:
+                from db_manager import db_manager
+                db_manager.save_chat_message(
+                    cookie_id=self.cookie_id,
+                    chat_id=cid,
+                    user_id=toid,
+                    role='seller',
+                    content=text_content,
+                    source='outgoing',
+                )
+            except Exception as e:
+                logger.warning(f"【{self.cookie_id}】保存发出消息失败: {self._safe_str(e)}")
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -8417,12 +8431,16 @@ class XianyuLive:
 
                 create_time = int(message_1.get("5", 0))
                 message_10 = message_1["10"]
-                send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
-                send_user_id = message_10.get("senderUserId", "unknown")
-                send_message = message_10.get("reminderContent", "")
+                send_user_name = str(
+                    message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
+                    or "未知用户"
+                )
+                send_user_id = str(message_10.get("senderUserId", "unknown") or "unknown").strip()
+                send_message = str(message_10.get("reminderContent", "") or "")
 
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
+                external_message_id = str(message_1.get("3") or "").strip() or None
 
             except Exception as e:
                 logger.error(f"提取聊天消息信息失败: {self._safe_str(e)}")
@@ -8434,7 +8452,30 @@ class XianyuLive:
 
 
             # 判断消息方向
-            if send_user_id == self.myid:
+            if send_user_id in (str(self.myid), str(self.cookie_id)):
+                try:
+                    from db_manager import db_manager
+                    conversation = db_manager.get_chat_conversation(self.cookie_id, chat_id) or {}
+                    peer_user_id = (
+                        conversation.get('user_id')
+                        or message_10.get("receiver")
+                        or message_10.get("receiverUserId")
+                        or send_user_id
+                    )
+                    db_manager.save_chat_message(
+                        cookie_id=self.cookie_id,
+                        chat_id=chat_id,
+                        user_id=peer_user_id,
+                        user_name=conversation.get('user_name') or '',
+                        item_id=item_id or conversation.get('item_id') or '',
+                        role='seller',
+                        content=send_message,
+                        external_message_id=external_message_id,
+                        source='xianyu_echo',
+                        created_at=msg_time,
+                    )
+                except Exception as e:
+                    logger.warning(f"【{self.cookie_id}】保存发出消息回显失败: {self._safe_str(e)}")
                 logger.info(f"[{msg_time}] 【手动发出】 商品({item_id}): {send_message}")
 
                 # 暂停该chat_id的自动回复10分钟
@@ -8442,6 +8483,22 @@ class XianyuLive:
 
                 return
             else:
+                try:
+                    from db_manager import db_manager
+                    db_manager.save_chat_message(
+                        cookie_id=self.cookie_id,
+                        chat_id=chat_id,
+                        user_id=send_user_id,
+                        user_name=send_user_name,
+                        item_id=item_id or '',
+                        role='buyer',
+                        content=send_message,
+                        external_message_id=external_message_id,
+                        source='xianyu',
+                        created_at=msg_time,
+                    )
+                except Exception as e:
+                    logger.warning(f"【{self.cookie_id}】保存收到消息失败: {self._safe_str(e)}")
                 logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）

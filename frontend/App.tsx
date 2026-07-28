@@ -8,6 +8,7 @@ import CardList from './components/CardList';
 import ItemList from './components/ItemList';
 import Settings from './components/Settings';
 import Keywords from './components/Keywords';
+import ChatManager from './components/ChatManager';
 import { login, verifyToken } from './services/api';
 import { ShieldCheck, ArrowRight, Loader2, Sparkles, User, Lock, KeyRound } from 'lucide-react';
 
@@ -158,6 +159,7 @@ const App: React.FC = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard />;
       case 'accounts': return <AccountList />;
+      case 'chats': return <ChatManager />;
       case 'orders': return <OrderList />;
       case 'reviews': return <ReviewList />;
       case 'cards': return <CardList />;

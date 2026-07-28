@@ -2,7 +2,8 @@ import { get, post, put, del } from '../lib/request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
-  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply, RefundDetail
+  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply, RefundDetail,
+  ChatConversation, ChatMessage
 } from '../types';
 
 // Auth
@@ -86,6 +87,37 @@ export const updateAccountLoginInfo = async (id: string, data: {
 
 export const getAllAISettings = async (): Promise<Record<string, AIReplySettings>> => {
   return get('/ai-reply-settings');
+};
+
+// Chats
+export const getChats = async (
+  cookieId?: string
+): Promise<{ data: ChatConversation[]; total: number; unread_total: number }> => {
+  const query = cookieId ? `?cookie_id=${encodeURIComponent(cookieId)}` : '';
+  return get(`/api/chats${query}`);
+};
+
+export const getChatMessages = async (
+  cookieId: string,
+  chatId: string,
+  limit: number = 200
+): Promise<{ data: ChatMessage[] }> => {
+  const query = new URLSearchParams({
+    cookie_id: cookieId,
+    limit: String(limit),
+  });
+  return get(`/api/chats/${encodeURIComponent(chatId)}/messages?${query.toString()}`);
+};
+
+export const sendChatMessage = async (
+  cookieId: string,
+  chatId: string,
+  content: string
+): Promise<{ success: boolean; message: string }> => {
+  return post(`/api/chats/${encodeURIComponent(chatId)}/messages`, {
+    cookie_id: cookieId,
+    content,
+  });
 };
 
 // Orders

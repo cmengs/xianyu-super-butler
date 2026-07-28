@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, Users, ShoppingBag, CreditCard, Settings, LogOut, Box, Sparkles, MessageSquare, Star } from 'lucide-react';
+import { LayoutDashboard, Users, ShoppingBag, CreditCard, Settings, LogOut, Box, Sparkles, MessageSquare, MessageCircle, Star } from 'lucide-react';
 
 interface SidebarProps {
   activeTab: string;
@@ -11,6 +11,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout }) 
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: '仪表盘' },
     { id: 'accounts', icon: Users, label: '账号管理' },
+    { id: 'chats', icon: MessageCircle, label: '聊天管理' },
     { id: 'orders', icon: ShoppingBag, label: '订单管理' },
     { id: 'reviews', icon: Star, label: '评价管理' },
     { id: 'cards', icon: CreditCard, label: '卡密库存' },
@@ -21,7 +22,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout }) 
 
   return (
     <div className="w-64 h-screen fixed left-0 top-0 bg-white border-r border-gray-100 flex flex-col justify-between z-20 shadow-[4px_0_24px_rgba(0,0,0,0.02)]">
-      <div className="p-6">
+      <div className="min-h-0 flex-1 overflow-y-auto p-6">
         <div className="flex items-center gap-3 mb-12 px-2">
           <div className="w-10 h-10 bg-[#FFE815] rounded-xl flex items-center justify-center shadow-lg shadow-yellow-200 transform rotate-[-3deg]">
             <span className="text-black font-extrabold text-xl">闲</span>

@@ -104,6 +104,36 @@ export interface RefundDetail {
   requires_app_action?: boolean;
 }
 
+export interface ChatConversation {
+  cookie_id: string;
+  account_name: string;
+  chat_id: string;
+  user_id: string;
+  user_name: string;
+  item_id?: string;
+  item_title?: string;
+  item_image?: string;
+  last_message: string;
+  last_role: 'buyer' | 'seller' | 'system';
+  last_message_at: string;
+  last_message_id: number;
+  unread_count: number;
+}
+
+export interface ChatMessage {
+  id: number;
+  cookie_id: string;
+  chat_id: string;
+  user_id: string;
+  user_name?: string;
+  item_id?: string;
+  role: 'buyer' | 'seller' | 'system';
+  content: string;
+  message_type: string;
+  source: string;
+  created_at: string;
+}
+
 // Cards
 export interface Card {
   id: number;
