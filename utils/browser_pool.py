@@ -215,21 +215,11 @@ class BrowserPool:
             # 创建页面
             page = await context.new_page()
 
-            # 设置额外的HTTP头
+            # 只设置通用请求头。不要把 sec-fetch-* / upgrade-insecure-requests
+            # 这类导航请求头强加到所有 XHR/fetch 请求上，否则闲鱼 mtop 接口
+            # 可能会拒绝或延迟返回，导致订单详情解析不到。
             headers = {
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "accept-language": "en,zh-CN;q=0.9,zh;q=0.8,ru;q=0.7",
-                "cache-control": "no-cache",
-                "pragma": "no-cache",
-                "priority": "u=0, i",
-                "sec-ch-ua": "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": "\"Windows\"",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1"
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
             }
             await context.set_extra_http_headers(headers)
 

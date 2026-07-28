@@ -997,6 +997,17 @@ class XianyuLive:
             # 先查看消息的完整结构
             logger.warning(f"【{self.cookie_id}】🔍 完整消息结构: {message}")
 
+            # VULCAN 交易事件会把订单号直接放在顶层 message['3'] 中。
+            # 这些消息不是聊天卡片，但包含最可靠的订单、商品、买卖家关系。
+            direct_data = message.get('3') if isinstance(message, dict) else None
+            if isinstance(direct_data, dict):
+                for direct_key in ('orderId', 'order_id', 'bizOrderId'):
+                    candidate = str(direct_data.get(direct_key) or '').strip()
+                    if candidate.isdigit() and len(candidate) >= 10:
+                        order_id = candidate
+                        logger.info(f'【{self.cookie_id}】✅ 从顶层交易事件提取到订单ID: {order_id}')
+                        break
+
             # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
             message_1 = message.get('1', {})
             content_json_str = ''
@@ -1099,6 +1110,595 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
             return None
+
+    def _extract_trade_context(self, message: dict) -> dict:
+        """从闲鱼提醒/卡片消息中提取订单、商品、买家上下文。"""
+        context = {
+            'order_id': None,
+            'item_id': None,
+            'buyer_id': None,
+            'seller_id': None,
+            'buyer_nick': None,
+            'avatar_name': None,
+            'item_title': None,
+            'card_title': None,
+        }
+
+        try:
+            context['order_id'] = self._extract_order_id(message)
+        except Exception:
+            context['order_id'] = None
+
+        def normalize_id(value, min_len: int = 6):
+            candidate = str(value or '').strip()
+            if candidate.isdigit() and len(candidate) >= min_len:
+                return candidate
+            return None
+
+        def apply_text(text: str):
+            if not isinstance(text, str) or not text:
+                return
+            if not context['item_id']:
+                item_match = re.search(r'(?:itemId|item_id)[=:](\d{10,})', text)
+                if item_match:
+                    context['item_id'] = item_match.group(1)
+            if not context['buyer_id']:
+                buyer_match = re.search(r'(?:peerUserId|buyerId|buyer_id|extUserId)[=:](\d{6,})', text)
+                if buyer_match:
+                    context['buyer_id'] = buyer_match.group(1)
+            if not context['seller_id']:
+                seller_match = re.search(r'(?:itemSellerId|ownerUserId|sellerId|seller_id)[=:](\d{6,})', text)
+                if seller_match:
+                    context['seller_id'] = seller_match.group(1)
+            if not context['order_id']:
+                order_match = re.search(r'(?:orderId|order_id|bizOrderId)[=:](\d{10,})', text)
+                if order_match:
+                    context['order_id'] = order_match.group(1)
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key in ('reminderUrl', 'targetUrl', 'pcJumpUrl', 'url') and isinstance(value, str):
+                        apply_text(value)
+                    if key in ('title', 'reminderTitle') and isinstance(value, str) and not context['card_title']:
+                        context['card_title'] = value
+                    if key in ('senderNick', 'buyerNick', 'buyer_nick') and isinstance(value, str) and not context['buyer_nick']:
+                        context['buyer_nick'] = value
+                    if key == 'avatarName' and isinstance(value, str) and not context['avatar_name']:
+                        context['avatar_name'] = value
+                    if key in ('itemTitle', 'item_title') and isinstance(value, str) and not context['item_title']:
+                        context['item_title'] = value
+                    if key in ('orderId', 'order_id', 'bizOrderId') and not context['order_id']:
+                        context['order_id'] = normalize_id(value, 10)
+                    if key in ('itemId', 'item_id') and isinstance(value, (str, int)) and not context['item_id']:
+                        context['item_id'] = normalize_id(value, 10)
+                    if key in ('itemSellerId', 'ownerUserId', 'sellerId', 'seller_id') and not context['seller_id']:
+                        context['seller_id'] = normalize_id(value)
+                    if key in ('peerUserId', 'buyerId', 'buyer_id', 'extUserId') and not context['buyer_id']:
+                        context['buyer_id'] = normalize_id(value)
+                    walk(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+            elif isinstance(obj, str):
+                apply_text(obj)
+                if obj.startswith('{') or obj.startswith('['):
+                    try:
+                        walk(json.loads(obj))
+                    except Exception:
+                        pass
+
+        try:
+            walk(message)
+        except Exception as e:
+            logger.warning(f"提取交易上下文失败: {self._safe_str(e)}")
+
+        return context
+
+    @staticmethod
+    def _clean_trade_status_text(text: str) -> str:
+        return re.sub(r'\s+', '', str(text or '').strip().strip('[]'))
+
+    def _is_refund_final_text(self, text: str) -> bool:
+        clean_text = self._clean_trade_status_text(text)
+        return bool(clean_text and any(keyword in clean_text for keyword in (
+            '退款成功',
+            '钱款已原路退返',
+            '已原路退返',
+            '交易关闭',
+        )))
+
+    def _is_refund_reverted_text(self, text: str) -> bool:
+        clean_text = self._clean_trade_status_text(text)
+        return bool(clean_text and '退款' in clean_text and any(keyword in clean_text for keyword in (
+            '撤销',
+            '取消申请',
+            '关闭',
+            '拒绝',
+        )))
+
+    def _is_refund_active_text(self, text: str) -> bool:
+        clean_text = self._clean_trade_status_text(text)
+        if not clean_text or self._is_refund_final_text(clean_text) or self._is_refund_reverted_text(clean_text):
+            return False
+        return bool('退款' in clean_text and any(keyword in clean_text for keyword in (
+            '退款中',
+            '申请',
+            '发起',
+            '处理中',
+            '协商',
+            '售后',
+            '待处理',
+        )))
+
+    def _normalize_trade_order_status(self, order_status=None, status_text: str = '') -> str:
+        clean_text = self._clean_trade_status_text(status_text)
+        status_code_map = {
+            '1': 'pending_payment',
+            '2': 'pending_ship',
+            '3': 'shipped',
+            '4': 'completed',
+            '5': 'refunding',
+            '6': 'cancelled',
+            '7': 'refunding',
+            '8': 'cancelled',
+            '9': 'refunding',
+            '10': 'cancelled',
+            '11': 'completed',
+            '12': 'cancelled',
+        }
+        status = str(order_status or '').strip()
+        known_statuses = ('processing', 'pending_payment', 'pending_ship', 'shipped', 'completed', 'cancelled', 'refunding')
+        if status in known_statuses:
+            mapped_status = status
+        elif status.isdigit():
+            mapped_status = status_code_map.get(status, 'unknown')
+        else:
+            mapped_status = status or 'unknown'
+
+        if self._is_refund_final_text(clean_text):
+            return 'cancelled'
+        if self._is_refund_active_text(clean_text):
+            return 'refunding'
+        if self._is_refund_reverted_text(clean_text):
+            return mapped_status if mapped_status in ('pending_ship', 'shipped', 'completed') else 'shipped'
+
+        if any(keyword in clean_text for keyword in ('快给ta一个评价', '快给TA一个评价', '评价吧')):
+            return 'completed'
+        if any(keyword in clean_text for keyword in ('关闭', '取消', '超时')):
+            return 'cancelled'
+        if any(keyword in clean_text for keyword in ('待付款', '等待买家付款', '拍下')):
+            return 'pending_payment'
+        if any(keyword in clean_text for keyword in ('待发货', '等待卖家发货', '买家已付款', '付款完成')):
+            return 'pending_ship'
+        if any(keyword in clean_text for keyword in ('已发货', '待买家确认收货', '等待买家确认收货')):
+            return 'shipped'
+        if any(keyword in clean_text for keyword in ('完成', '交易成功', '买家确认收货', '买家已确认收货')):
+            return 'completed'
+
+        return mapped_status
+
+    def _resolve_refund_reverted_order_status(self, order_id: str = None) -> str:
+        """退款撤销后恢复订单本身状态。查不到历史时，已发货订单回到 shipped。"""
+        try:
+            from db_manager import db_manager
+
+            order_id = str(order_id or '').strip()
+            if not order_id:
+                return 'shipped'
+
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(
+                    "SELECT order_status, status_text, system_shipped FROM orders WHERE order_id = ? LIMIT 1",
+                    (order_id,)
+                )
+                row = cursor.fetchone()
+
+            if not row:
+                return 'shipped'
+
+            current_status = str(row[0] or '').strip()
+            status_text = str(row[1] or '').strip()
+            system_shipped = bool(row[2])
+
+            if current_status in ('pending_ship', 'shipped', 'completed'):
+                return current_status
+            if system_shipped:
+                return 'shipped'
+
+            clean_text = self._clean_trade_status_text(status_text)
+            if any(keyword in clean_text for keyword in ('已发货', '待买家确认收货')):
+                return 'shipped'
+            if any(keyword in clean_text for keyword in ('待发货', '等待卖家发货', '买家已付款', '付款完成')):
+                return 'pending_ship'
+            if any(keyword in clean_text for keyword in ('完成', '交易成功', '确认收货')):
+                return 'completed'
+
+            return 'pending_ship'
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】恢复退款撤销状态失败: {self._safe_str(e)}")
+            return 'shipped'
+
+    def _find_recent_order_id_for_notice(self, item_id: str = None, buyer_id: str = None) -> str:
+        """交易提醒缺少订单号时，按商品和买家匹配最近一条未关闭订单。"""
+        try:
+            from db_manager import db_manager
+
+            item_id = str(item_id or '').strip()
+            buyer_id = str(buyer_id or '').strip()
+            if item_id == '未知商品':
+                item_id = ''
+            if not item_id and not buyer_id:
+                return ''
+
+            where_parts = ["cookie_id = ?", "COALESCE(order_status, '') != 'cancelled'"]
+            params = [self.cookie_id]
+            if item_id:
+                where_parts.append("item_id = ?")
+                params.append(item_id)
+            if buyer_id and buyer_id.isdigit():
+                where_parts.append("buyer_id = ?")
+                params.append(buyer_id)
+
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(f'''
+                    SELECT order_id
+                    FROM orders
+                    WHERE {' AND '.join(where_parts)}
+                    ORDER BY
+                        CASE
+                            WHEN order_status IN ('shipped', 'pending_ship', 'refunding', 'unknown') THEN 0
+                            ELSE 1
+                        END,
+                        datetime(COALESCE(NULLIF(created_at, ''), updated_at)) DESC,
+                        datetime(updated_at) DESC
+                    LIMIT 1
+                ''', params)
+                row = cursor.fetchone()
+                return str(row[0]) if row else ''
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】按商品/买家匹配交易提醒订单失败: {self._safe_str(e)}")
+            return ''
+
+    def _save_trade_notice_order(
+        self,
+        message: dict,
+        order_status: str,
+        status_text: str,
+        msg_time: str,
+        fallback_item_id: str = None,
+        fallback_buyer_id: str = None,
+        chat_id: str = None,
+        trade_context: dict = None,
+        review_status: str = None,
+        seller_review_status: str = None,
+        buyer_review_status: str = None,
+    ) -> bool:
+        """保存待付款/取消等交易提醒，避免系统卡片ID污染订单数据。"""
+        try:
+            from db_manager import db_manager
+
+            trade_context = trade_context or self._extract_trade_context(message)
+            order_id = trade_context.get('order_id')
+            if not order_id:
+                order_id = self._find_recent_order_id_for_notice(
+                    item_id=trade_context.get('item_id') or fallback_item_id,
+                    buyer_id=trade_context.get('buyer_id') or fallback_buyer_id,
+                )
+                if order_id:
+                    trade_context['order_id'] = order_id
+                    logger.info(f'[{msg_time}] 【{self.cookie_id}】交易提醒缺少订单ID，已按商品/买家匹配到订单: {order_id}')
+                else:
+                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】交易提醒缺少订单ID，跳过写库: {status_text}')
+                    return False
+
+            existing_order = db_manager.get_order_by_id(order_id) or {}
+
+            def clean_id(value):
+                return str(value or '').strip()
+
+            def is_valid_id(value, min_len: int = 6):
+                candidate = clean_id(value)
+                return candidate if candidate.isdigit() and len(candidate) >= min_len else None
+
+            def unique_values(values):
+                seen = set()
+                result = []
+                for value in values:
+                    value = clean_id(value)
+                    if value and value not in seen:
+                        seen.add(value)
+                        result.append(value)
+                return result
+
+            try:
+                local_cookie_ids = list((db_manager.get_all_cookies() or {}).keys())
+            except Exception:
+                local_cookie_ids = []
+
+            def lookup_cookie_remark(candidate_cookie_id):
+                candidate_cookie_id = is_valid_id(candidate_cookie_id)
+                if not candidate_cookie_id:
+                    return ''
+                try:
+                    details = db_manager.get_cookie_details(candidate_cookie_id) or {}
+                    return clean_id(details.get('remark')) or clean_id(details.get('username'))
+                except Exception:
+                    return ''
+
+            def find_local_item(candidate_item_id):
+                candidate_item_id = is_valid_id(candidate_item_id, 10)
+                if not candidate_item_id:
+                    return None, None
+
+                lookup_cookie_ids = unique_values([
+                    trade_context.get('seller_id'),
+                    existing_order.get('cookie_id'),
+                    self.cookie_id,
+                    *local_cookie_ids,
+                ])
+                for lookup_cookie_id in lookup_cookie_ids:
+                    try:
+                        info = db_manager.get_item_info(lookup_cookie_id, candidate_item_id)
+                    except Exception:
+                        info = None
+                    if info:
+                        return lookup_cookie_id, info
+                return None, None
+
+            item_candidates = [
+                trade_context.get('item_id'),
+                existing_order.get('item_id'),
+                fallback_item_id,
+            ]
+
+            safe_item_id = None
+            item_info = None
+            owner_cookie_id = None
+            for candidate in item_candidates:
+                candidate = clean_id(candidate)
+                if not candidate or candidate.startswith('auto_'):
+                    continue
+                owner_cookie_id, item_info = find_local_item(candidate)
+                if item_info:
+                    safe_item_id = candidate
+                    break
+
+            if not safe_item_id:
+                logger.warning(
+                    f'[{msg_time}] 【{self.cookie_id}】交易提醒未找到有效商品ID，保留订单但不写入可疑商品: {item_candidates}'
+                )
+
+            save_cookie_id = (
+                owner_cookie_id
+                or is_valid_id(trade_context.get('seller_id'))
+                or clean_id(existing_order.get('cookie_id'))
+                or self.cookie_id
+            )
+            if local_cookie_ids and save_cookie_id not in local_cookie_ids:
+                save_cookie_id = clean_id(existing_order.get('cookie_id')) or self.cookie_id
+
+            buyer_closed_order = any(
+                keyword in str(status_text or '')
+                for keyword in ('买家关闭订单', '买家关闭了订单', '未付款')
+            )
+            if buyer_closed_order:
+                buyer_candidates = [
+                    fallback_buyer_id,
+                    trade_context.get('buyer_id'),
+                    existing_order.get('buyer_id'),
+                ]
+            else:
+                buyer_candidates = [
+                    trade_context.get('buyer_id'),
+                    existing_order.get('buyer_id'),
+                    fallback_buyer_id,
+                ]
+            safe_buyer_id = None
+            for candidate in buyer_candidates:
+                candidate = is_valid_id(candidate)
+                if candidate and candidate != save_cookie_id and candidate != safe_item_id:
+                    safe_buyer_id = candidate
+                    break
+            if not safe_buyer_id and is_valid_id(self.cookie_id) and self.cookie_id != save_cookie_id:
+                safe_buyer_id = self.cookie_id
+
+            amount = existing_order.get('amount') or None
+            if not amount and item_info:
+                item_price = str(item_info.get('item_price') or '').strip()
+                amount = item_price.replace('¥', '').replace('￥', '').strip() or None
+
+            safe_buyer_nick = (
+                (clean_id(trade_context.get('avatar_name')) if buyer_closed_order else '')
+                or clean_id(trade_context.get('buyer_nick'))
+                or clean_id(existing_order.get('buyer_nick'))
+                or lookup_cookie_remark(safe_buyer_id)
+            )
+
+            return db_manager.insert_or_update_order(
+                order_id=order_id,
+                item_id=safe_item_id,
+                buyer_id=safe_buyer_id,
+                quantity=existing_order.get('quantity') or '1',
+                amount=amount,
+                order_status=order_status,
+                status_text=status_text,
+                review_status=review_status,
+                seller_review_status=seller_review_status,
+                buyer_review_status=buyer_review_status,
+                cookie_id=save_cookie_id,
+                created_at=existing_order.get('created_at') or msg_time,
+                buyer_nick=safe_buyer_nick,
+                chat_id=chat_id or existing_order.get('chat_id') or ''
+            )
+        except Exception as e:
+            logger.error(f'[{msg_time}] 【{self.cookie_id}】保存交易提醒订单失败: {self._safe_str(e)}')
+            return False
+
+    def _save_review_event_order(
+        self,
+        message: dict,
+        msg_time: str,
+        fallback_item_id: str = None,
+        fallback_buyer_id: str = None,
+        chat_id: str = None,
+    ) -> bool:
+        """保存买家/卖家单侧评价完成事件。"""
+        try:
+            try:
+                text_blob = json.dumps(message, ensure_ascii=False, default=str)
+            except Exception:
+                text_blob = str(message)
+
+            has_review_done_text = any(keyword in text_blob for keyword in (
+                '我完成了评价',
+                '已完成评价',
+                '评价完成',
+                '评价成功',
+            ))
+            has_review_update_key = any(keyword in text_blob for keyword in (
+                'BUYER_RATE',
+                'SELLER_RATE',
+            ))
+            if not (has_review_done_text or has_review_update_key):
+                return False
+
+            trade_context = self._extract_trade_context(message)
+            order_id = trade_context.get('order_id')
+            if not order_id:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】评价完成事件未提取到订单ID，跳过写库')
+                return False
+
+            from db_manager import db_manager
+
+            existing_order = db_manager.get_order_by_id(order_id) or {}
+            seller_status = str(existing_order.get('seller_review_status') or '').strip()
+            buyer_status = str(existing_order.get('buyer_review_status') or '').strip()
+
+            actor_id = ''
+            message_1 = message.get('1') if isinstance(message, dict) else None
+            if isinstance(message_1, dict) and isinstance(message_1.get('10'), dict):
+                actor_id = str(message_1['10'].get('senderUserId') or '').strip()
+            elif isinstance(message, dict) and isinstance(message.get('4'), dict):
+                actor_id = str(message['4'].get('senderUserId') or '').strip()
+
+            owner_cookie_id = str(existing_order.get('cookie_id') or '').strip()
+            existing_buyer_id = str(existing_order.get('buyer_id') or '').strip()
+
+            review_side = ''
+            if 'BUYER_RATE' in text_blob:
+                review_side = 'buyer'
+            elif 'SELLER_RATE' in text_blob:
+                review_side = 'seller'
+            elif actor_id and owner_cookie_id and actor_id == owner_cookie_id:
+                review_side = 'seller'
+            elif actor_id and existing_buyer_id and actor_id == existing_buyer_id:
+                review_side = 'buyer'
+            elif 'role=Buyer' in text_blob:
+                review_side = 'buyer'
+            elif 'role=Seller' in text_blob:
+                review_side = 'seller'
+
+            if review_side == 'buyer':
+                buyer_status = 'reviewed'
+                status_text = '买家已评价'
+            elif review_side == 'seller':
+                seller_status = 'reviewed'
+                status_text = '卖家已评价'
+            else:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】评价完成事件未能判断评价方，跳过写库: order={order_id}')
+                return False
+
+            aggregate_review_status = (
+                'reviewed'
+                if seller_status == 'reviewed' and buyer_status == 'reviewed'
+                else 'pending_review'
+            )
+
+            saved = self._save_trade_notice_order(
+                message=message,
+                order_status='completed',
+                status_text=status_text,
+                msg_time=msg_time,
+                fallback_item_id=fallback_item_id,
+                fallback_buyer_id=fallback_buyer_id or actor_id,
+                chat_id=chat_id,
+                trade_context=trade_context,
+                review_status=aggregate_review_status,
+                seller_review_status=seller_status,
+                buyer_review_status=buyer_status,
+            )
+            if saved:
+                logger.info(
+                    f'[{msg_time}] 【{self.cookie_id}】评价状态已更新: '
+                    f'order={order_id}, side={review_side}, '
+                    f'seller={seller_status or "pending"}, buyer={buyer_status or "pending"}'
+                )
+            return saved
+        except Exception as e:
+            logger.error(f'[{msg_time}] 【{self.cookie_id}】保存评价完成事件失败: {self._safe_str(e)}')
+            return False
+
+    def _save_vulcan_trade_event(self, message: dict, msg_time: str) -> bool:
+        """保存非聊天 VULCAN 交易事件中的订单基础信息。"""
+        try:
+            if self.is_chat_message(message):
+                return False
+
+            trade_context = self._extract_trade_context(message)
+            if not (
+                trade_context.get('order_id')
+                and trade_context.get('item_id')
+                and (trade_context.get('seller_id') or trade_context.get('buyer_id'))
+            ):
+                return False
+
+            text_blob = str(message)
+            order_status = None
+            status_text = ''
+            if self._is_refund_final_text(text_blob):
+                order_status = 'cancelled'
+                status_text = '退款成功'
+            elif self._is_refund_reverted_text(text_blob):
+                order_status = self._resolve_refund_reverted_order_status(trade_context.get('order_id'))
+                status_text = '买家撤销退款申请'
+            elif self._is_refund_active_text(text_blob):
+                order_status = 'refunding'
+                status_text = '我发起了退款申请'
+            elif '交易成功' in text_blob or '买家已确认收货' in text_blob or '买家确认收货' in text_blob:
+                order_status = 'completed'
+                status_text = '买家已确认收货，交易成功'
+            elif '交易关闭' in text_blob or '买家关闭' in text_blob:
+                order_status = 'cancelled'
+                status_text = '交易关闭'
+            elif '等待买家付款' in text_blob or '待付款' in text_blob:
+                order_status = 'pending_payment'
+                status_text = '等待买家付款'
+
+            if not order_status:
+                return False
+
+            saved = self._save_trade_notice_order(
+                message=message,
+                order_status=order_status,
+                status_text=status_text,
+                msg_time=msg_time,
+                fallback_item_id=trade_context.get('item_id'),
+                fallback_buyer_id=trade_context.get('buyer_id'),
+                trade_context=trade_context,
+            )
+            if saved:
+                logger.info(
+                    f'[{msg_time}] 【{self.cookie_id}】VULCAN交易事件已落库: '
+                    f"order={trade_context.get('order_id')}, item={trade_context.get('item_id')}, "
+                    f"seller={trade_context.get('seller_id')}, buyer={trade_context.get('buyer_id')}"
+                )
+            return saved
+        except Exception as e:
+            logger.error(f'[{msg_time}] 【{self.cookie_id}】保存VULCAN交易事件失败: {self._safe_str(e)}')
+            return False
 
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
@@ -2775,6 +3375,40 @@ class XianyuLive:
                 logger.warning(f"停止playwright时出错: {self._safe_str(e)}")
 
 
+    def _has_real_item_detail(self, item_info):
+        """Return True only when saved item data contains real detail text."""
+        if not item_info:
+            return False
+
+        for field in ('item_description', 'item_detail_text'):
+            value = item_info.get(field)
+            if isinstance(value, str) and value.strip():
+                return True
+
+        detail = item_info.get('item_detail') or ''
+        if not isinstance(detail, str) or not detail.strip():
+            return False
+
+        detail = detail.strip()
+        if not detail.startswith('{'):
+            return True
+
+        try:
+            detail_payload = json.loads(detail)
+        except Exception:
+            return False
+
+        if not isinstance(detail_payload, dict):
+            return False
+
+        for key in ('detail', 'description', 'desc', 'item_description'):
+            value = detail_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+
+        return False
+
+
     async def save_items_list_to_db(self, items_list):
         """批量保存商品列表信息到数据库（并发安全）
 
@@ -2793,6 +3427,9 @@ class XianyuLive:
                 if not item_id or item_id.startswith('auto_'):
                     continue
 
+                pic_info = item.get('pic_info') or {}
+                item_image = pic_info.get('picUrl', '') if isinstance(pic_info, dict) else ''
+
                 # 构造商品详情数据
                 item_detail = {
                     'title': item.get('title', ''),
@@ -2803,7 +3440,7 @@ class XianyuLive:
                     'item_status': item.get('item_status', 0),
                     'detail_url': item.get('detail_url', ''),
                     'web_url': item.get('web_url', ''),  # Web可访问URL
-                    'pic_info': item.get('pic_info', {}),
+                    'pic_info': pic_info,
                     'detail_params': item.get('detail_params', {}),
                     'track_params': item.get('track_params', {}),
                     'item_label_data': item.get('item_label_data', {}),
@@ -2812,7 +3449,7 @@ class XianyuLive:
 
                 # 检查数据库中是否已有详情
                 existing_item = db_manager.get_item_info(self.cookie_id, item_id)
-                has_detail = existing_item and existing_item.get('item_detail') and existing_item['item_detail'].strip()
+                has_detail = self._has_real_item_detail(existing_item)
 
                 batch_data.append({
                     'cookie_id': self.cookie_id,
@@ -2821,6 +3458,7 @@ class XianyuLive:
                     'item_description': '',  # 暂时为空
                     'item_category': str(item.get('category_id', '')),
                     'item_price': item.get('price_text', ''),
+                    'item_image': item_image,
                     'item_detail': json.dumps(item_detail, ensure_ascii=False)
                 })
 
@@ -3020,8 +3658,8 @@ class XianyuLive:
             # 方法1: 从message["1"]中提取（如果是字符串格式）
             message_1 = message.get('1')
             if isinstance(message_1, str):
-                # 尝试从字符串中提取数字ID
-                id_match = re.search(r'(\d{10,})', message_1)
+                # 只从明确标注的 itemId 中提取，避免把用户ID/订单ID当商品ID。
+                id_match = re.search(r'(?:itemId|item_id)[=:](\d{10,})', message_1)
                 if id_match:
                     logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
                     return id_match.group(1)
@@ -3059,7 +3697,7 @@ class XianyuLive:
                 # 从消息内容中提取数字ID
                 content = message_3.get('content', '')
                 if isinstance(content, str) and content:
-                    id_match = re.search(r'(\d{10,})', content)
+                    id_match = re.search(r'(?:itemId|item_id)[=:](\d{10,})', content)
                     if id_match:
                         logger.info(f"【{self.cookie_id}】从消息内容中提取商品ID: {id_match.group(1)}")
                         return id_match.group(1)
@@ -3067,8 +3705,8 @@ class XianyuLive:
             # 方法3: 遍历整个消息结构查找可能的商品ID
             def find_item_id_recursive(obj, path=""):
                 if isinstance(obj, dict):
-                    # 直接查找itemId字段
-                    for key in ['itemId', 'item_id', 'id']:
+                    # 只查找明确的商品ID字段；普通 id 可能是订单/用户/卡片ID，不能当商品ID。
+                    for key in ['itemId', 'item_id']:
                         if key in obj and isinstance(obj[key], (str, int)):
                             value = str(obj[key])
                             if len(value) >= 10 and value.isdigit():
@@ -3082,8 +3720,8 @@ class XianyuLive:
                             return result
 
                 elif isinstance(obj, str):
-                    # 从字符串中提取可能的商品ID
-                    id_match = re.search(r'(\d{10,})', obj)
+                    # 从字符串中只提取明确标注的 itemId，避免把 orderId/userId 当商品ID。
+                    id_match = re.search(r'(?:itemId|item_id)[=:](\d{10,})', obj)
                     if id_match:
                         logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
                         return id_match.group(1)
@@ -4353,7 +4991,7 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送自动发货通知异常: {self._safe_str(e)}")
 
-    async def auto_confirm(self, order_id, item_id=None, retry_count=0):
+    async def auto_confirm(self, order_id, item_id=None, retry_count=0, trade_text=""):
         """自动确认发货 - 使用加密模块，不包含延时处理（延时已在_auto_delivery中处理）"""
         try:
             logger.warning(f"【{self.cookie_id}】开始确认发货，订单ID: {order_id}")
@@ -4370,7 +5008,7 @@ class XianyuLive:
             secure_confirm.token_refresh_interval = self.token_refresh_interval
 
             # 调用确认方法，传入item_id用于token刷新
-            result = await secure_confirm.auto_confirm(order_id, item_id, retry_count)
+            result = await secure_confirm.auto_confirm(order_id, item_id, retry_count, trade_text)
 
             # 同步更新后的cookies和token
             if secure_confirm.cookies_str != self.cookies_str:
@@ -4484,20 +5122,40 @@ class XianyuLive:
                             logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
                         else:
                             # 先保存订单基本信息（包含时间和收货人信息）
+                            status_text = result.get('status_text') or ''
+                            normalized_order_status = self._normalize_trade_order_status(
+                                result.get('order_status'),
+                                status_text
+                            )
+                            if any(keyword in status_text for keyword in ('已评价', '评价成功', '评价完成')):
+                                review_status = 'pending_review'
+                                seller_review_status = 'reviewed'
+                            elif result.get('can_rate'):
+                                review_status = 'pending_review'
+                                seller_review_status = None
+                            else:
+                                review_status = None
+                                seller_review_status = None
+
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=buyer_id,
+                                item_id=result.get('item_id') or item_id,
+                                buyer_id=result.get('buyer_id') or buyer_id,
                                 spec_name=spec_name,
                                 spec_value=spec_value,
                                 quantity=quantity,
                                 amount=amount,
-                                order_status=result.get('order_status'),  # 添加订单状态
+                                order_status=normalized_order_status,  # 添加订单状态
                                 cookie_id=self.cookie_id,
                                 created_at=order_time,
+                                buyer_nick=result.get('buyer_nick') or None,
+                                status_text=status_text or None,
+                                review_status=review_status,
+                                seller_review_status=seller_review_status,
                                 receiver_name=receiver_name,
                                 receiver_phone=receiver_phone,
-                                receiver_address=receiver_address
+                                receiver_address=receiver_address,
+                                receiver_city=result.get('receiver_city') or None
                             )
                             
                             # 使用订单状态处理器设置状态
@@ -7506,6 +8164,12 @@ class XianyuLive:
             self.last_message_received_time = time.time()
             logger.warning(f"【{self.cookie_id}】收到消息，更新消息接收时间标识")
 
+            msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            if self._save_review_event_order(message, msg_time):
+                return
+            if self._save_vulcan_trade_event(message, msg_time):
+                return
+
             # 【优先处理】尝试获取订单ID并获取订单详情
             order_id = None
             try:
@@ -7626,16 +8290,106 @@ class XianyuLive:
 
                 # 安全地检查订单状态
                 red_reminder = None
-                if isinstance(message, dict) and "3" in message and isinstance(message["3"], dict):
-                    red_reminder = message["3"].get("redReminder")
+                red_meta = {}
+                if isinstance(message, dict):
+                    meta_candidates = []
+                    if isinstance(message.get("3"), dict):
+                        meta_candidates.append(message["3"])
+                    message_1 = message.get("1")
+                    if isinstance(message_1, dict) and isinstance(message_1.get("10"), dict):
+                        meta_candidates.append(message_1["10"])
+                    for meta in meta_candidates:
+                        if meta.get("redReminder"):
+                            red_reminder = meta.get("redReminder")
+                            red_meta = meta
+                            break
 
+                if red_reminder and self._is_refund_final_text(red_reminder):
+                    trade_context = self._extract_trade_context(message)
+                    trade_buyer_id = trade_context.get('buyer_id') or red_meta.get('senderUserId') or user_id
+                    user_url = f'https://www.goofish.com/personal?userId={trade_buyer_id}'
+                    logger.info(f'[{msg_time}] 【系统】买家 {user_url} 退款完成/交易关闭')
+                    self._save_trade_notice_order(
+                        message=message,
+                        order_status='cancelled',
+                        status_text=red_reminder,
+                        msg_time=msg_time,
+                        fallback_item_id=item_id,
+                        fallback_buyer_id=trade_buyer_id,
+                        trade_context=trade_context
+                    )
+                    return
+                if red_reminder and self._is_refund_reverted_text(red_reminder):
+                    trade_context = self._extract_trade_context(message)
+                    trade_buyer_id = trade_context.get('buyer_id') or red_meta.get('senderUserId') or user_id
+                    restored_status = self._resolve_refund_reverted_order_status(trade_context.get('order_id'))
+                    user_url = f'https://www.goofish.com/personal?userId={trade_buyer_id}'
+                    logger.info(f'[{msg_time}] 【系统】买家 {user_url} 撤销退款申请，恢复状态为 {restored_status}')
+                    self._save_trade_notice_order(
+                        message=message,
+                        order_status=restored_status,
+                        status_text=red_reminder,
+                        msg_time=msg_time,
+                        fallback_item_id=item_id,
+                        fallback_buyer_id=trade_buyer_id,
+                        trade_context=trade_context
+                    )
+                    return
+                if red_reminder and self._is_refund_active_text(red_reminder):
+                    trade_context = self._extract_trade_context(message)
+                    trade_buyer_id = trade_context.get('buyer_id') or red_meta.get('senderUserId') or user_id
+                    user_url = f'https://www.goofish.com/personal?userId={trade_buyer_id}'
+                    logger.info(f'[{msg_time}] 【系统】买家 {user_url} 发起退款申请')
+                    self._save_trade_notice_order(
+                        message=message,
+                        order_status='refunding',
+                        status_text=red_reminder,
+                        msg_time=msg_time,
+                        fallback_item_id=item_id,
+                        fallback_buyer_id=trade_buyer_id,
+                        trade_context=trade_context
+                    )
+                    return
                 if red_reminder == '等待买家付款':
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                    trade_context = self._extract_trade_context(message)
+                    trade_buyer_id = trade_context.get('buyer_id') or red_meta.get('senderUserId') or user_id
+                    user_url = f'https://www.goofish.com/personal?userId={trade_buyer_id}'
                     logger.info(f'[{msg_time}] 【系统】等待买家 {user_url} 付款')
+                    self._save_trade_notice_order(
+                        message=message,
+                        order_status='pending_payment',
+                        status_text='等待买家付款',
+                        msg_time=msg_time,
+                        fallback_item_id=item_id,
+                        fallback_buyer_id=trade_buyer_id,
+                        trade_context=trade_context
+                    )
                     return
                 elif red_reminder == '交易关闭':
-                    user_url = f'https://www.goofish.com/personal?userId={user_id}'
+                    trade_context = self._extract_trade_context(message)
+                    trade_buyer_id = trade_context.get('buyer_id') or red_meta.get('senderUserId') or user_id
+                    user_url = f'https://www.goofish.com/personal?userId={trade_buyer_id}'
                     logger.info(f'[{msg_time}] 【系统】买家 {user_url} 交易关闭')
+                    self._save_trade_notice_order(
+                        message=message,
+                        order_status='cancelled',
+                        status_text='交易关闭',
+                        msg_time=msg_time,
+                        fallback_item_id=item_id,
+                        fallback_buyer_id=trade_buyer_id,
+                        trade_context=trade_context
+                    )
+                    if self.order_status_handler:
+                        try:
+                            self.order_status_handler.handle_red_reminder_message(
+                                message=message,
+                                red_reminder=red_reminder,
+                                user_id=trade_buyer_id,
+                                cookie_id=self.cookie_id,
+                                msg_time=msg_time
+                            )
+                        except Exception as status_e:
+                            logger.error(f"【{self.cookie_id}】处理交易关闭状态失败: {self._safe_str(status_e)}")
                     return
                 elif red_reminder == '等待卖家发货':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
@@ -7744,6 +8498,28 @@ class XianyuLive:
                 except Exception as e:
                     logger.error(f"订单状态处理失败: {self._safe_str(e)}")
 
+            if self._is_refund_active_text(send_message):
+                trade_context = self._extract_trade_context(message)
+                if order_id and not trade_context.get('order_id'):
+                    trade_context['order_id'] = order_id
+
+                saved = self._save_trade_notice_order(
+                    message=message,
+                    order_status='refunding',
+                    status_text='我发起了退款申请',
+                    msg_time=msg_time,
+                    fallback_item_id=item_id,
+                    fallback_buyer_id=send_user_id,
+                    chat_id=chat_id,
+                    trade_context=trade_context
+                )
+                if saved:
+                    refund_order_id = trade_context.get('order_id') or order_id
+                    logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {refund_order_id} 已标记为退款中: {send_message}')
+                else:
+                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】退款申请消息未提取到订单ID: {send_message}')
+                return
+
             # 【优先处理】检查系统消息和自动发货触发消息（不受人工接入暂停影响）
             if send_message == '[我已拍下，待付款]':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
@@ -7767,7 +8543,31 @@ class XianyuLive:
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】交易完成消息不处理')
                 return
             elif send_message == '快给ta一个评价吧~' or send_message == '快给ta一个评价吧～':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】评价提醒消息不处理')
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到评价提醒消息')
+                order_id = self._extract_order_id(message)
+                if order_id:
+                    try:
+                        from db_manager import db_manager
+                        existing_order = db_manager.get_order_by_id(order_id) or {}
+                        safe_buyer_id = existing_order.get('buyer_id')
+                        if not safe_buyer_id and send_user_id not in (self.myid, self.cookie_id):
+                            safe_buyer_id = send_user_id
+
+                        db_manager.insert_or_update_order(
+                            order_id=order_id,
+                            item_id=existing_order.get('item_id') or item_id,
+                            buyer_id=safe_buyer_id,
+                            order_status='completed',
+                            status_text=send_message,
+                            review_status='pending_review',
+                            cookie_id=self.cookie_id,
+                            chat_id=chat_id
+                        )
+                        logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 已加入待评价列表')
+                    except Exception as e:
+                        logger.error(f'[{msg_time}] 【{self.cookie_id}】保存评价提醒失败: {self._safe_str(e)}')
+                else:
+                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】评价提醒未提取到订单ID')
                 return
             elif send_message == '卖家人不错？送Ta闲鱼小红花':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】小红花提醒消息不处理')
@@ -7811,6 +8611,75 @@ class XianyuLive:
                                                 card_title = ex_content.get("title", "")
                                     except (json.JSONDecodeError, KeyError) as e:
                                         logger.warning(f"解析卡片消息失败: {e}")
+
+                    if card_title and self._is_refund_reverted_text(card_title):
+                        trade_context = self._extract_trade_context(message)
+                        restored_status = self._resolve_refund_reverted_order_status(trade_context.get('order_id'))
+                        saved = self._save_trade_notice_order(
+                            message=message,
+                            order_status=restored_status,
+                            status_text=card_title,
+                            msg_time=msg_time,
+                            fallback_item_id=item_id,
+                            fallback_buyer_id=send_user_id,
+                            chat_id=chat_id,
+                            trade_context=trade_context
+                        )
+                        if saved:
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】卡片消息已恢复退款撤销后的订单状态: {card_title} -> {restored_status}')
+                        else:
+                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】退款撤销卡片未提取到订单ID: {card_title}')
+                        return
+
+                    if card_title and self._is_refund_active_text(card_title):
+                        saved = self._save_trade_notice_order(
+                            message=message,
+                            order_status='refunding',
+                            status_text=card_title,
+                            msg_time=msg_time,
+                            fallback_item_id=item_id,
+                            fallback_buyer_id=send_user_id,
+                            chat_id=chat_id
+                        )
+                        if saved:
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】卡片消息已更新订单为退款中: {card_title}')
+                        else:
+                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】退款申请卡片未提取到订单ID: {card_title}')
+                        return
+
+                    if card_title and any(keyword in card_title for keyword in ("买家已确认收货", "买家确认收货", "交易成功")):
+                        trade_context = self._extract_trade_context(message)
+                        saved = self._save_trade_notice_order(
+                            message=message,
+                            order_status='completed',
+                            status_text=card_title,
+                            msg_time=msg_time,
+                            fallback_item_id=item_id,
+                            fallback_buyer_id=send_user_id,
+                            chat_id=chat_id,
+                            trade_context=trade_context
+                        )
+                        if saved:
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】卡片消息已更新订单为已完成: {card_title}')
+                        else:
+                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】成交卡片未提取到订单ID: {card_title}')
+                        return
+
+                    if card_title and any(keyword in card_title for keyword in ("买家关闭订单", "买家关闭了订单", "交易关闭", "已关闭交易")):
+                        saved = self._save_trade_notice_order(
+                            message=message,
+                            order_status='cancelled',
+                            status_text=card_title,
+                            msg_time=msg_time,
+                            fallback_item_id=item_id,
+                            fallback_buyer_id=send_user_id,
+                            chat_id=chat_id
+                        )
+                        if saved:
+                            logger.info(f'[{msg_time}] 【{self.cookie_id}】卡片消息已更新订单为已取消: {card_title}')
+                        else:
+                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】取消订单卡片未提取到订单ID: {card_title}')
+                        return
 
                     # 检查是否为"我已小刀，待刀成"
                     if card_title == "我已小刀，待刀成":
@@ -8378,29 +9247,15 @@ class XianyuLive:
 
                     logger.info(f"成功获取到 {len(items_list)} 个商品")
 
-                    # 打印商品详细信息到控制台
-                    print("\n" + "="*80)
-                    print(f"📦 账号 {self.myid} 的商品列表 (第{page_number}页，{len(items_list)} 个商品)")
-                    print("="*80)
-
-                    for i, item in enumerate(items_list, 1):
-                        print(f"\n🔸 商品 {i}:")
-                        print(f"   商品ID: {item.get('id', 'N/A')}")
-                        print(f"   商品标题: {item.get('title', 'N/A')}")
-                        print(f"   价格: {item.get('price_text', 'N/A')}")
-                        print(f"   分类ID: {item.get('category_id', 'N/A')}")
-                        print(f"   商品状态: {item.get('item_status', 'N/A')}")
-                        print(f"   拍卖类型: {item.get('auction_type', 'N/A')}")
-                        print(f"   详情链接: {item.get('detail_url', 'N/A')}")
-                        if item.get('pic_info'):
-                            pic_info = item['pic_info']
-                            print(f"   图片信息: {pic_info.get('width', 'N/A')}x{pic_info.get('height', 'N/A')}")
-                            print(f"   图片链接: {pic_info.get('picUrl', 'N/A')}")
-                        print(f"   完整信息: {json.dumps(item, ensure_ascii=False, indent=2)}")
-
-                    print("\n" + "="*80)
-                    print("✅ 商品列表获取完成")
-                    print("="*80)
+                    # 后台启动时 stdout 可能不可写，避免调试打印中断商品保存流程。
+                    for i, item in enumerate(items_list[:5], 1):
+                        logger.debug(
+                            f"商品 {i}: ID={item.get('id', 'N/A')}, "
+                            f"标题={item.get('title', 'N/A')}, "
+                            f"价格={item.get('price_text', 'N/A')}"
+                        )
+                    if len(items_list) > 5:
+                        logger.debug(f"商品列表日志仅显示前5个，剩余 {len(items_list) - 5} 个已省略")
 
                     # 自动保存商品信息到数据库
                     if items_list:

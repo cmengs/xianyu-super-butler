@@ -84,7 +84,7 @@ class SecureConfirm:
             logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
 
 
-    async def auto_confirm(self, order_id, item_id=None, retry_count=0):
+    async def auto_confirm(self, order_id, item_id=None, retry_count=0, trade_text=""):
         """自动确认发货 - 使用真实商品ID刷新token"""
         if retry_count >= 4:  # 最多重试3次
             logger.error("自动确认发货失败，重试次数过多")
@@ -113,7 +113,12 @@ class SecureConfirm:
             'sessionOption': 'AutoLoginOnly',
         }
 
-        data_val = '{"orderId":"' + order_id + '", "tradeText":"","picList":[],"newUnconsign":true}'
+        data_val = json.dumps({
+            "orderId": str(order_id),
+            "tradeText": str(trade_text or ""),
+            "picList": [],
+            "newUnconsign": True
+        }, ensure_ascii=False, separators=(',', ':'))
         data = {
             'data': data_val,
         }
@@ -165,7 +170,7 @@ class SecureConfirm:
                     error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
                     logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
 
-                    return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                    return await self.auto_confirm(order_id, item_id, retry_count + 1, trade_text)
 
 
         except Exception as e:
@@ -175,6 +180,6 @@ class SecureConfirm:
             # 网络异常也进行重试
             if retry_count < 2:
                 logger.info(f"【{self.cookie_id}】网络异常，准备重试...")
-                return await self.auto_confirm(order_id, item_id, retry_count + 1)
+                return await self.auto_confirm(order_id, item_id, retry_count + 1, trade_text)
 
             return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}

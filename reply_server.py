@@ -5927,6 +5927,111 @@ def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_d
 
 # ==================== 订单管理接口 ====================
 
+def _derive_review_status(result: Dict[str, Any], order_status: str = None) -> Optional[str]:
+    """从订单详情结果里推断评价状态。"""
+    status_text = str(result.get('status_text') or '').strip()
+    if any(keyword in status_text for keyword in ('已评价', '评价成功', '评价完成')):
+        return result.get('review_status') or 'pending_review'
+    if result.get('can_rate'):
+        return 'pending_review'
+    if '评价' in status_text and any(keyword in status_text for keyword in ('待', '去', '给', '可')):
+        return 'pending_review'
+    if order_status == 'completed' and any(keyword in status_text for keyword in ('交易成功', '完成')):
+        return result.get('review_status') or None
+    return result.get('review_status') or None
+
+def _derive_seller_review_status(result: Dict[str, Any]) -> Optional[str]:
+    """订单详情里的“已评价”来自卖家工作台视角，按卖家已评记录。"""
+    status_text = str(result.get('status_text') or '').strip()
+    if any(keyword in status_text for keyword in ('已评价', '评价成功', '评价完成')):
+        return 'reviewed'
+    return result.get('seller_review_status') or None
+
+def _clean_order_status_text(status_text: str) -> str:
+    return re.sub(r'\s+', '', str(status_text or '').strip().strip('[]'))
+
+def _is_refund_final_status_text(status_text: str) -> bool:
+    clean_text = _clean_order_status_text(status_text)
+    return bool(clean_text and any(keyword in clean_text for keyword in (
+        '退款成功',
+        '钱款已原路退返',
+        '已原路退返',
+        '交易关闭',
+    )))
+
+def _is_refund_reverted_status_text(status_text: str) -> bool:
+    clean_text = _clean_order_status_text(status_text)
+    return bool(clean_text and '退款' in clean_text and any(keyword in clean_text for keyword in (
+        '撤销',
+        '取消申请',
+        '关闭',
+        '拒绝',
+    )))
+
+def _is_refund_active_status_text(status_text: str) -> bool:
+    clean_text = _clean_order_status_text(status_text)
+    if not clean_text or _is_refund_final_status_text(clean_text) or _is_refund_reverted_status_text(clean_text):
+        return False
+    return bool('退款' in clean_text and any(keyword in clean_text for keyword in (
+        '退款中',
+        '申请',
+        '发起',
+        '处理中',
+        '协商',
+        '售后',
+        '待处理',
+    )))
+
+def _normalize_order_status(order_status: Any, status_text: str = '') -> str:
+    """统一订单状态映射，退款文本优先于状态码，避免退款申请被误判为关闭。"""
+    clean_text = _clean_order_status_text(status_text)
+    status_mapping = {
+        '1': 'pending_payment',
+        '2': 'pending_ship',
+        '3': 'shipped',
+        '4': 'completed',
+        '5': 'refunding',
+        '6': 'cancelled',
+        '7': 'refunding',
+        '8': 'cancelled',
+        '9': 'refunding',
+        '10': 'cancelled',
+        '11': 'completed',
+        '12': 'cancelled',
+    }
+    status = str(order_status or '').strip()
+    known_statuses = {
+        'processing', 'pending_payment', 'pending_ship',
+        'shipped', 'completed', 'cancelled', 'refunding', 'unknown'
+    }
+    if status in known_statuses:
+        mapped_status = status
+    elif status.isdigit():
+        mapped_status = status_mapping.get(status, 'unknown')
+    else:
+        mapped_status = status or 'unknown'
+
+    if _is_refund_final_status_text(clean_text):
+        return 'cancelled'
+    if _is_refund_active_status_text(clean_text):
+        return 'refunding'
+    if _is_refund_reverted_status_text(clean_text):
+        return mapped_status if mapped_status in ('pending_ship', 'shipped', 'completed') else 'shipped'
+
+    if any(keyword in clean_text for keyword in ('快给ta一个评价', '快给TA一个评价', '评价吧')):
+        return 'completed'
+    if any(keyword in clean_text for keyword in ('关闭', '取消', '超时')):
+        return 'cancelled'
+    if any(keyword in clean_text for keyword in ('待付款', '等待买家付款', '拍下')):
+        return 'pending_payment'
+    if any(keyword in clean_text for keyword in ('待发货', '等待卖家发货', '买家已付款', '付款完成')):
+        return 'pending_ship'
+    if any(keyword in clean_text for keyword in ('已发货', '待买家确认收货', '等待买家确认收货')):
+        return 'shipped'
+    if any(keyword in clean_text for keyword in ('完成', '交易成功', '买家确认收货')):
+        return 'completed'
+    return mapped_status
+
 @app.get('/api/orders')
 def get_user_orders(
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -5951,20 +6056,27 @@ def get_user_orders(
 
         # 获取所有订单数据
         all_orders = []
-        # 先获取所有商品的 item_id 到 item_title 的映射
-        item_titles = {}
+        # 先获取所有商品的 (cookie_id, item_id) 到商品展示信息的映射
+        item_meta = {}
         with db_manager.lock:
             cursor = db_manager.conn.cursor()
-            cursor.execute('SELECT item_id, item_title FROM item_info')
+            cursor.execute('SELECT cookie_id, item_id, item_title, item_image, item_price FROM item_info')
             for row in cursor.fetchall():
-                item_titles[row[0]] = row[1]
+                item_meta[(row[0], row[1])] = {
+                    'item_title': row[2] or '',
+                    'item_image': row[3] or '',
+                    'item_price': row[4] or ''
+                }
 
         for cid in user_cookies.keys():
             orders = db_manager.get_orders_by_cookie(cid, limit=1000)
             for order in orders:
                 order['cookie_id'] = cid
-                # 添加 item_title 字段
-                order['item_title'] = item_titles.get(order.get('item_id'), '')
+                # 添加商品展示字段
+                meta = item_meta.get((cid, order.get('item_id')), {})
+                order['item_title'] = meta.get('item_title', '')
+                order['item_image'] = meta.get('item_image', '')
+                order['item_price'] = meta.get('item_price', '')
                 # 状态筛选
                 if status and order.get('status') != status:
                     continue
@@ -5995,6 +6107,141 @@ def get_user_orders(
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
 
 
+@app.get('/api/reviews')
+def get_user_reviews(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+    cookie_id: Optional[str] = Query(None, description="筛选Cookie ID"),
+    status: Optional[str] = Query(None, description="评价状态：pending_review/reviewed")
+):
+    """获取当前用户的评价任务列表。"""
+    try:
+        from db_manager import db_manager
+
+        user_id = current_user['user_id']
+        log_with_user('info', f"查询用户评价任务 (page={page}, page_size={page_size}, status={status})", current_user)
+
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cookie_id and cookie_id in user_cookies:
+            user_cookies = {cookie_id: user_cookies[cookie_id]}
+
+        item_meta = {}
+        with db_manager.lock:
+            cursor = db_manager.conn.cursor()
+            cursor.execute('SELECT cookie_id, item_id, item_title, item_image, item_price FROM item_info')
+            for row in cursor.fetchall():
+                item_meta[(row[0], row[1])] = {
+                    'item_title': row[2] or '',
+                    'item_image': row[3] or '',
+                    'item_price': row[4] or ''
+                }
+
+        reviews = []
+        for cid in user_cookies.keys():
+            orders = db_manager.get_orders_by_cookie(cid, limit=1000)
+            for order in orders:
+                review_status = order.get('review_status') or ''
+                seller_review_status = order.get('seller_review_status') or ''
+                buyer_review_status = order.get('buyer_review_status') or ''
+
+                if seller_review_status == 'reviewed' or buyer_review_status == 'reviewed':
+                    review_status = (
+                        'reviewed'
+                        if seller_review_status == 'reviewed' and buyer_review_status == 'reviewed'
+                        else 'pending_review'
+                    )
+                elif review_status == 'reviewed':
+                    # Legacy aggregate state cannot prove which side reviewed.
+                    review_status = 'pending_review'
+
+                if review_status not in ('pending_review', 'reviewed'):
+                    continue
+                if status and status != 'all' and review_status != status:
+                    continue
+
+                order['cookie_id'] = cid
+                order['review_status'] = review_status
+                order['seller_review_status'] = seller_review_status
+                order['buyer_review_status'] = buyer_review_status
+                meta = item_meta.get((cid, order.get('item_id')), {})
+                order['item_title'] = meta.get('item_title', '')
+                order['item_image'] = meta.get('item_image', '')
+                order['item_price'] = meta.get('item_price', '')
+                reviews.append(order)
+
+        reviews.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+        total = len(reviews)
+        total_pages = (total + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        paginated_reviews = reviews[start_idx:start_idx + page_size]
+
+        return {
+            "success": True,
+            "data": paginated_reviews,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages
+        }
+
+    except Exception as e:
+        log_with_user('error', f"查询用户评价任务失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"查询评价任务失败: {str(e)}")
+
+
+@app.put('/api/reviews/{order_id}/status')
+def update_review_status(
+    order_id: str,
+    update_data: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """手动标记评价状态。"""
+    try:
+        from db_manager import db_manager
+
+        review_status = update_data.get('review_status')
+        if review_status not in ('pending_review', 'reviewed'):
+            raise HTTPException(status_code=400, detail="评价状态无效")
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="订单不存在")
+        if order.get('cookie_id') not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权修改此评价")
+
+        buyer_review_status = order.get('buyer_review_status') or ''
+        seller_review_status = (
+            'reviewed'
+            if review_status == 'reviewed'
+            else update_data.get('seller_review_status')
+        )
+        aggregate_status = (
+            'reviewed'
+            if seller_review_status == 'reviewed' and buyer_review_status == 'reviewed'
+            else 'pending_review'
+        )
+        success = db_manager.insert_or_update_order(
+            order_id=order_id,
+            review_status=aggregate_status,
+            seller_review_status=seller_review_status,
+            buyer_review_status=buyer_review_status,
+            status_text='卖家已评价' if seller_review_status == 'reviewed' else (order.get('status_text') or '待评价')
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="更新评价状态失败")
+
+        return {"success": True, "message": "评价状态已更新", "data": db_manager.get_order_by_id(order_id)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"更新评价状态失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"更新评价状态失败: {str(e)}")
+
+
 @app.get('/api/orders/{order_id}')
 def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取订单详情"""
@@ -6022,6 +6269,148 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
     except Exception as e:
         log_with_user('error', f"查询订单详情失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
+
+
+@app.get('/api/orders/{order_id}/refund')
+async def get_order_refund_detail(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """实时读取退款原因和当前可用的卖家操作。"""
+    try:
+        from utils.refund_service import fetch_refund_detail
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="订单不存在")
+
+        cookie_id = order.get('cookie_id')
+        if not cookie_id or cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权查看此退款申请")
+
+        cookie_string = user_cookies.get(cookie_id)
+        if not cookie_string:
+            raise HTTPException(status_code=400, detail="订单所属账号的 Cookie 无效")
+
+        log_with_user('info', f"读取退款详情: {order_id}", current_user)
+        detail = await fetch_refund_detail(
+            order_id=order_id,
+            cookie_id=cookie_id,
+            cookie_string=cookie_string,
+        )
+
+        db_manager.insert_or_update_order(
+            order_id=order_id,
+            refund_reason=detail.get('refund_reason') or None,
+            refund_description=detail.get('refund_description') or None,
+        )
+        return {"success": True, "data": detail}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"读取退款详情失败: {order_id} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"读取退款详情失败: {str(e)}")
+
+
+@app.post('/api/orders/{order_id}/refund/action')
+async def handle_order_refund_action(
+    order_id: str,
+    action_data: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """同意或拒绝买家的退款申请，并在提交后刷新订单状态。"""
+    try:
+        from utils.order_fetcher_optimized import process_orders_batch
+        from utils.refund_service import execute_refund_action
+
+        action = str(action_data.get('action') or '').strip().lower()
+        reject_reason = str(action_data.get('reason') or '').strip()
+        reject_description = str(action_data.get('description') or '').strip()
+        if action not in ('approve', 'reject'):
+            raise HTTPException(status_code=400, detail="退款操作必须是 approve 或 reject")
+        if action == 'reject' and not reject_reason:
+            raise HTTPException(status_code=400, detail="请选择拒绝退款原因")
+        if len(reject_description) > 500:
+            raise HTTPException(status_code=400, detail="拒绝说明不能超过 500 个字符")
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail="订单不存在")
+        if order.get('order_status') != 'refunding':
+            raise HTTPException(status_code=409, detail="该订单当前不是退款中状态，请先刷新订单")
+
+        cookie_id = order.get('cookie_id')
+        if not cookie_id or cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权处理此退款申请")
+        cookie_string = user_cookies.get(cookie_id)
+        if not cookie_string:
+            raise HTTPException(status_code=400, detail="订单所属账号的 Cookie 无效")
+
+        action_name = '确认退款' if action == 'approve' else '拒绝退款'
+        log_with_user('warning', f"{action_name}: order_id={order_id}", current_user)
+        result = await execute_refund_action(
+            order_id=order_id,
+            cookie_id=cookie_id,
+            cookie_string=cookie_string,
+            action=action,
+            reject_reason=reject_reason or None,
+            reject_description=reject_description or None,
+        )
+
+        if result.get('requires_app'):
+            return {
+                **result,
+                "data": db_manager.get_order_by_id(order_id),
+            }
+
+        batch_results = await process_orders_batch(
+            order_ids=[order_id],
+            cookie_id=cookie_id,
+            cookie_string=cookie_string,
+            max_concurrent=1,
+            timeout=30,
+            headless=True,
+            use_pool=True,
+            force_refresh=True,
+        )
+        refreshed = batch_results[0] if batch_results else {}
+        if refreshed and not refreshed.get('error'):
+            refreshed_status = _normalize_order_status(
+                refreshed.get('order_status', 'unknown'),
+                refreshed.get('status_text', ''),
+            )
+            db_manager.insert_or_update_order(
+                order_id=order_id,
+                item_id=refreshed.get('item_id') or None,
+                buyer_id=refreshed.get('buyer_id') or None,
+                spec_name=refreshed.get('spec_name') or None,
+                spec_value=refreshed.get('spec_value') or None,
+                quantity=refreshed.get('quantity') or None,
+                amount=refreshed.get('amount') or None,
+                order_status=refreshed_status,
+                buyer_nick=refreshed.get('buyer_nick') or None,
+                status_text=refreshed.get('status_text') or None,
+                receiver_name=refreshed.get('receiver_name') or None,
+                receiver_phone=refreshed.get('receiver_phone') or None,
+                receiver_address=refreshed.get('receiver_address') or None,
+                receiver_city=refreshed.get('receiver_city') or None,
+            )
+
+        return {
+            **result,
+            "data": db_manager.get_order_by_id(order_id),
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"处理退款申请失败: {order_id} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=f"处理退款申请失败: {str(e)}")
 
 
 @app.delete('/api/orders/{order_id}')
@@ -6107,24 +6496,11 @@ async def refresh_single_order(
         if result.get('error'):
             raise HTTPException(status_code=500, detail=f"刷新失败: {result.get('error')}")
 
-        # 状态码映射
-        order_status = result.get('order_status', 'unknown')
-        if order_status and str(order_status).isdigit():
-            status_mapping = {
-                '1': 'processing',
-                '2': 'pending_ship',
-                '3': 'shipped',
-                '4': 'completed',
-                '5': 'refunding',
-                '6': 'cancelled',
-                '7': 'refunding',
-                '8': 'cancelled',
-                '9': 'refunding',
-                '10': 'cancelled',
-                '11': 'completed',
-                '12': 'cancelled',
-            }
-            order_status = status_mapping.get(str(order_status), order_status)
+        # 状态码/状态文案统一映射。退款申请类文本优先，避免误判为交易关闭。
+        order_status = _normalize_order_status(
+            result.get('order_status', 'unknown'),
+            result.get('status_text', '')
+        )
 
         # 更新数据库
         db_manager.insert_or_update_order(
@@ -6137,9 +6513,15 @@ async def refresh_single_order(
             amount=result.get('amount') or None,
             order_status=order_status,
             cookie_id=cookie_id,
+            created_at=result.get('order_time') or None,
+            buyer_nick=result.get('buyer_nick') or None,
+            status_text=result.get('status_text') or None,
+            review_status=_derive_review_status(result, order_status),
+            seller_review_status=_derive_seller_review_status(result),
             receiver_name=result.get('receiver_name') or None,
             receiver_phone=result.get('receiver_phone') or None,
             receiver_address=result.get('receiver_address') or None,
+            receiver_city=result.get('receiver_city') or None,
         )
 
         log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
@@ -6238,22 +6620,11 @@ async def update_order(
                     if complete_result:
                         log_with_user('info', f"成功获取订单 {order_id} 的完整数据（一次浏览器调用）", current_user)
 
-                        # 状态码映射（如果需要转换）
-                        order_status = complete_result.get('order_status', 'unknown')
-                        if order_status and isinstance(order_status, str) and order_status.isdigit():
-                            status_mapping = {
-                                '1': 'processing',
-                                '2': 'pending_ship',
-                                '3': 'shipped',
-                                '4': 'completed',
-                                '5': 'refunding',
-                                '6': 'cancelled',
-                                '7': 'refunding',
-                                '8': 'cancelled',
-                                '9': 'refunding',
-                                '10': 'cancelled',
-                            }
-                            order_status = status_mapping.get(order_status, order_status)
+                        # 状态码/状态文案统一映射。退款申请类文本优先，避免误判为交易关闭。
+                        order_status = _normalize_order_status(
+                            complete_result.get('order_status', 'unknown'),
+                            complete_result.get('status_text', '')
+                        )
 
                         # 构建要更新的完整数据
                         refresh_data = {
@@ -6266,9 +6637,14 @@ async def update_order(
                             'quantity': complete_result.get('quantity') or None,
                             'amount': complete_result.get('amount') or None,
                             'created_at': complete_result.get('order_time') or None,
+                            'buyer_nick': complete_result.get('buyer_nick') or None,
+                            'status_text': complete_result.get('status_text') or None,
+                            'review_status': _derive_review_status(complete_result, order_status),
+                            'seller_review_status': _derive_seller_review_status(complete_result),
                             'receiver_name': complete_result.get('receiver_name') or None,
                             'receiver_phone': complete_result.get('receiver_phone') or None,
-                            'receiver_address': complete_result.get('receiver_address') or None
+                            'receiver_address': complete_result.get('receiver_address') or None,
+                            'receiver_city': complete_result.get('receiver_city') or None
                         }
 
                         # 更新数据库
@@ -6286,9 +6662,11 @@ async def update_order(
         # 提取可更新的字段
         allowed_fields = {
             'item_id', 'buyer_id', 'spec_name', 'spec_value',
-            'quantity', 'amount', 'order_status',
+            'quantity', 'amount', 'order_status', 'buyer_nick', 'status_text',
             'receiver_name', 'receiver_phone', 'receiver_address',
-            'system_shipped', 'created_at'
+            'receiver_city', 'system_shipped', 'created_at', 'review_status',
+            'seller_review_status', 'buyer_review_status',
+            'refund_reason', 'refund_description'
         }
 
         # 只保留允许更新的字段
@@ -6383,9 +6761,26 @@ async def refresh_orders_status(
 
                 order_status = order.get('status', 'unknown')
 
-                # 判断是否需要刷新：只根据状态判断
-                # 稳定状态（已发货、交易成功、交易关闭）的订单不需要刷新
+                # Active orders always need refresh. Stable orders are skipped only when
+                # the key display fields are already complete.
                 needs_refresh = order_status not in ['shipped', 'completed', 'cancelled']
+                if not needs_refresh:
+                    amount = str(order.get('amount') or '').strip()
+                    buyer_id = str(order.get('buyer_id') or '').strip()
+                    buyer_nick = str(order.get('buyer_nick') or '').strip()
+                    status_text = str(order.get('status_text') or '').strip()
+                    receiver_name = str(order.get('receiver_name') or '').strip()
+                    receiver_phone = str(order.get('receiver_phone') or '').strip()
+                    receiver_address = str(order.get('receiver_address') or '').strip()
+                    needs_refresh = (
+                        not amount or amount in ('待获取', 'unknown') or
+                        not buyer_id or buyer_id == 'unknown_user' or
+                        not buyer_nick or
+                        not status_text or
+                        not receiver_name or
+                        not receiver_phone or
+                        not receiver_address
+                    )
 
                 if needs_refresh:
                     orders_to_refresh.append({
@@ -6459,24 +6854,11 @@ async def refresh_orders_status(
                     dom_status = result.get('dom_status', 'N/A')
                     log_with_user('debug', f"订单 {order_id} - API状态: {api_status}, DOM状态: {dom_status}", current_user)
 
-                    # 状态码映射
-                    order_status = result.get('order_status', 'unknown')
-                    if order_status and str(order_status).isdigit():
-                        status_mapping = {
-                            '1': 'processing',
-                            '2': 'pending_ship',
-                            '3': 'shipped',
-                            '4': 'completed',
-                            '5': 'refunding',
-                            '6': 'cancelled',
-                            '7': 'refunding',
-                            '8': 'cancelled',
-                            '9': 'refunding',
-                            '10': 'cancelled',
-                            '11': 'completed',  # 交易完成
-                            '12': 'cancelled',  # 交易关闭
-                        }
-                        order_status = status_mapping.get(str(order_status), order_status)
+                    # 状态码/状态文案统一映射。退款申请类文本优先，避免误判为交易关闭。
+                    order_status = _normalize_order_status(
+                        result.get('order_status', 'unknown'),
+                        result.get('status_text', '')
+                    )
 
                     # 更新数据库
                     success = db_manager.insert_or_update_order(
@@ -6490,9 +6872,14 @@ async def refresh_orders_status(
                         order_status=order_status if order_status != current_status else None,
                         cookie_id=cid,
                         created_at=result.get('order_time') or None,
+                        buyer_nick=result.get('buyer_nick') or None,
+                        status_text=result.get('status_text') or None,
+                        review_status=_derive_review_status(result, order_status),
+                        seller_review_status=_derive_seller_review_status(result),
                         receiver_name=result.get('receiver_name') or None,
                         receiver_phone=result.get('receiver_phone') or None,
-                        receiver_address=result.get('receiver_address') or None
+                        receiver_address=result.get('receiver_address') or None,
+                        receiver_city=result.get('receiver_city') or None
                     )
 
                     if success:
@@ -6567,36 +6954,8 @@ async def refresh_orders_status(
                             new_status_code = status_result.get('order_status')
                             new_status_text = status_result.get('status_text', '')
 
-                            # 将状态码转换为数据库状态
-                            # 完整的订单状态码映射（基于闲鱼API）
-                            status_mapping = {
-                                1: 'processing',      # 处理中
-                                2: 'pending_ship',    # 待发货
-                                3: 'shipped',         # 已发货
-                                4: 'completed',       # 已完成/交易成功
-                                5: 'refunding',       # 退款中
-                                6: 'cancelled',       # 已取消/已关闭
-                                7: 'refunding',       # 退款申请中
-                                8: 'cancelled',       # 退款成功（订单关闭）
-                                9: 'refunding',       # 退款协商中
-                                10: 'cancelled',      # 退款关闭
-                            }
-                            new_status = status_mapping.get(new_status_code, 'unknown')
-
-                            # 特殊处理：根据状态文本智能识别（优先检查最终状态）
-                            if new_status == 'unknown':
-                                # 优先级1: 检查"退款成功"（最终状态）
-                                if '退款' in new_status_text and '成功' in new_status_text:
-                                    new_status = 'cancelled'  # 退款成功=订单关闭
-                                # 优先级2: 检查"关闭"或"取消"（最终状态）
-                                elif '关闭' in new_status_text or '取消' in new_status_text or '超时' in new_status_text:
-                                    new_status = 'cancelled'
-                                # 优先级3: 检查"完成"或"交易成功"（最终状态）
-                                elif '完成' in new_status_text or '交易成功' in new_status_text or '确认收货' in new_status_text:
-                                    new_status = 'completed'
-                                # 优先级4: 检查"退款"（中间状态）
-                                elif '退款' in new_status_text:
-                                    new_status = 'refunding'
+                            # 状态码/状态文案统一映射。退款申请类文本优先，避免误判为交易关闭。
+                            new_status = _normalize_order_status(new_status_code, new_status_text)
 
                             log_with_user('debug', f"订单 {order_id}: 状态码={new_status_code}, 状态文本={new_status_text}, 映射结果={new_status}", current_user)
 
@@ -6754,6 +7113,10 @@ async def manual_ship_orders(
         if ship_mode not in ['status_only', 'full_delivery']:
             raise HTTPException(status_code=400, detail="发货模式必须是 status_only 或 full_delivery")
 
+        ship_remark = (custom_content or '').strip()
+        if len(ship_remark) > 500:
+            raise HTTPException(status_code=400, detail="发货备注不能超过500个字符")
+
         # 获取用户的所有Cookie
         user_cookies = db_manager.get_all_cookies(user_id)
 
@@ -6821,19 +7184,24 @@ async def manual_ship_orders(
                             timeout=aiohttp.ClientTimeout(total=30)
                         ) as session:
                             confirm = SecureConfirm(session, cookies_str, cookie_id, None)
-                            confirm_result = await confirm.auto_confirm(order_id, item_id)
+                            confirm_result = await confirm.auto_confirm(
+                                order_id,
+                                item_id,
+                                trade_text=ship_remark
+                            )
 
                         if confirm_result and confirm_result.get('success'):
                             # 更新本地数据库状态
                             db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 order_status='shipped',
+                                status_text='已发货',
                                 system_shipped=True
                             )
                             results.append({
                                 'order_id': order_id,
                                 'success': True,
-                                'message': '已成功修改闲鱼发货状态'
+                                'message': '已提交发货备注并修改闲鱼发货状态' if ship_remark else '已成功修改闲鱼发货状态'
                             })
                             success_count += 1
                         else:
@@ -7046,10 +7414,10 @@ async def import_orders(
         required_fields = ['order_id', 'cookie_id']
         optional_fields = [
             'item_id', 'item_title', 'item_price', 'item_image',
-            'buyer_id',
+            'buyer_id', 'buyer_nick',
             'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
             'status', 'status_text', 'order_time', 'pay_time',
-            'quantity', 'amount'
+            'quantity', 'amount', 'review_status', 'seller_review_status', 'buyer_review_status'
         ]
 
         for order_data in orders:
@@ -7092,13 +7460,17 @@ async def import_orders(
                 param_mapping = {
                     'item_id': 'item_id',
                     'buyer_id': 'buyer_id',
+                    'buyer_nick': 'buyer_nick',
                     'receiver_name': 'receiver_name',
                     'receiver_phone': 'receiver_phone',
                     'receiver_address': 'receiver_address',
                     'receiver_city': 'receiver_city',
                     'status': 'order_status',  # 注意：前端用 status，后端用 order_status
                     'status_text': 'status_text',
-                    'order_time': 'order_time',
+                    'review_status': 'review_status',
+                    'seller_review_status': 'seller_review_status',
+                    'buyer_review_status': 'buyer_review_status',
+                    'order_time': 'created_at',
                     'pay_time': 'pay_time',
                     'quantity': 'quantity',
                     'amount': 'amount',

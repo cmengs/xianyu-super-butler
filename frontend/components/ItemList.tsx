@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Item, AccountDetail } from '../types';
 import { getItems, getAccountDetails, syncItemsFromAccount } from '../services/api';
 import { Box, RefreshCw, ShoppingBag, Edit, Trash2, Plus, Save, X, Eye, EyeOff } from 'lucide-react';
@@ -10,6 +11,7 @@ const ItemList: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [detailItem, setDetailItem] = useState<Item | null>(null);
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
   const [editForm, setEditForm] = useState<Partial<Item>>({});
   const [addForm, setAddForm] = useState({
@@ -120,6 +122,28 @@ const ItemList: React.FC = () => {
     }
   };
 
+  const getItemImage = (item: Item) => {
+    const url = item.item_image || item.item_detail_parsed?.pic_info?.picUrl || '';
+    return url.startsWith('http://') ? `https://${url.slice(7)}` : url;
+  };
+
+  const getItemDescription = (item: Item) => {
+    const rawDetail = typeof item.item_detail === 'string' && !item.item_detail.trim().startsWith('{')
+      ? item.item_detail
+      : '';
+    return item.item_description || item.item_detail_text || rawDetail || '';
+  };
+
+  const handleImageError = (event: React.SyntheticEvent<HTMLImageElement>) => {
+    const image = event.currentTarget;
+    if (image.dataset.fallbackApplied !== 'true' && image.src.toLowerCase().includes('.heic')) {
+      image.dataset.fallbackApplied = 'true';
+      image.src = `${image.src}_320x320q90.jpg`;
+      return;
+    }
+    image.style.display = 'none';
+  };
+
   return (
     <div className="space-y-6 animate-fade-in">
       <div className="flex justify-between items-center">
@@ -176,8 +200,13 @@ const ItemList: React.FC = () => {
                       </button>
                   </div>
                   <div className="aspect-square bg-gray-100 rounded-2xl mb-4 overflow-hidden relative">
-                      {item.item_image ? (
-                          <img src={item.item_image} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                      {getItemImage(item) ? (
+                          <img
+                            src={getItemImage(item)}
+                            alt=""
+                            onError={handleImageError}
+                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                          />
                       ) : (
                           <div className="w-full h-full flex items-center justify-center text-gray-300">
                               <Box className="w-10 h-10" />
@@ -188,6 +217,15 @@ const ItemList: React.FC = () => {
                       </div>
                   </div>
                   <h3 className="font-bold text-gray-900 line-clamp-2 text-sm mb-2 h-10">{item.item_title}</h3>
+                  <p className="text-xs text-gray-500 line-clamp-2 mb-3 h-8">{getItemDescription(item) || '暂无详情'}</p>
+                  <button
+                    onClick={() => setDetailItem(item)}
+                    className="mb-3 inline-flex items-center gap-1 text-xs font-bold text-gray-700 hover:text-gray-950 disabled:text-gray-300"
+                    disabled={!getItemDescription(item)}
+                  >
+                    <Eye className="w-3.5 h-3.5" />
+                    查看详情
+                  </button>
                   <div className="flex justify-between items-center text-xs text-gray-500 mb-2">
                       <span className="bg-gray-100 px-2 py-1 rounded-md truncate max-w-[100px]">ID: {item.item_id}</span>
                   </div>
@@ -222,6 +260,63 @@ const ItemList: React.FC = () => {
              </div>
           )}
       </div>
+
+      {detailItem && createPortal((
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4 backdrop-blur-sm"
+          onClick={() => setDetailItem(null)}
+        >
+          <div
+            className="w-full max-w-3xl rounded-3xl bg-white p-6 shadow-2xl"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <h3 className="text-xl font-bold text-gray-900">商品详情</h3>
+                <p className="mt-1 line-clamp-2 text-sm text-gray-500">{detailItem.item_title}</p>
+              </div>
+              <button
+                onClick={() => setDetailItem(null)}
+                className="rounded-full bg-gray-100 p-2 text-gray-500 transition-colors hover:bg-gray-200 hover:text-gray-900"
+                title="关闭"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="grid gap-5 md:grid-cols-[180px_1fr]">
+              <div className="aspect-square overflow-hidden rounded-2xl bg-gray-100">
+                {getItemImage(detailItem) ? (
+                  <img
+                    src={getItemImage(detailItem)}
+                    alt=""
+                    onError={handleImageError}
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <div className="flex h-full w-full items-center justify-center text-gray-300">
+                    <Box className="h-10 w-10" />
+                  </div>
+                )}
+              </div>
+
+              <div className="min-w-0">
+                <div className="mb-3 flex flex-wrap gap-2 text-xs text-gray-500">
+                  <span className="rounded-lg bg-gray-100 px-2 py-1">ID: {detailItem.item_id}</span>
+                  {detailItem.item_price && (
+                    <span className="rounded-lg bg-yellow-100 px-2 py-1 font-bold text-gray-900">¥{detailItem.item_price}</span>
+                  )}
+                </div>
+                <div className="max-h-[55vh] overflow-y-auto rounded-2xl bg-gray-50 p-4">
+                  <p className="whitespace-pre-wrap text-sm leading-6 text-gray-700">
+                    {getItemDescription(detailItem) || '暂无详情'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ), document.body)}
     </div>
   );
 };

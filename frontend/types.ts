@@ -53,6 +53,7 @@ export interface AccountDetail {
 // Orders
 export type OrderStatus = 
   | 'processing'      
+  | 'pending_payment'
   | 'pending_ship'    
   | 'shipped'         
   | 'completed'       
@@ -68,14 +69,39 @@ export interface Order {
   item_image?: string;
   item_price?: string;
   buyer_id: string;
+  buyer_nick?: string;
   quantity: number;
   amount: string;
   status: OrderStatus;
+  status_text?: string;
+  review_status?: 'pending_review' | 'reviewed' | '';
+  seller_review_status?: 'reviewed' | '';
+  buyer_review_status?: 'reviewed' | '';
+  refund_reason?: string;
+  refund_description?: string;
   receiver_name?: string;
   receiver_phone?: string;
   receiver_address?: string;
+  receiver_city?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface RefundDetail {
+  order_id: string;
+  refund_id?: string;
+  refund_reason?: string;
+  refund_description?: string;
+  refund_amount?: string;
+  refund_type?: string;
+  refund_requested_at?: string;
+  page_status?: string;
+  page_status_description?: string;
+  detail_url?: string;
+  can_approve: boolean;
+  can_reject: boolean;
+  reject_options?: Array<{ id: string; name: string }>;
+  requires_app_action?: boolean;
 }
 
 // Cards
@@ -117,8 +143,20 @@ export interface Item {
   item_title?: string;
   item_price?: string;
   item_image?: string; // Inferred from common usage, though not explicitly in list model sometimes
+  item_description?: string;
+  item_detail?: string;
+  item_detail_text?: string;
+  item_detail_parsed?: {
+    pic_info?: {
+      picUrl?: string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
   item_category?: string;
   is_multi_spec?: number | boolean;
+  is_multi_qty_ship?: number | boolean;
+  multi_quantity_delivery?: number | boolean;
   created_at?: string;
 }
 

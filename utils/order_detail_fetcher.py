@@ -238,9 +238,12 @@ class OrderDetailFetcher:
                     receiver_phone = existing_order.get('receiver_phone', '')
                     receiver_address = existing_order.get('receiver_address', '')
 
-                    # 只有金额有效时才使用缓存（不再检查收货人信息是否完整）
-                    if amount_valid:
-                        logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
+                    current_status = existing_order.get('order_status') or existing_order.get('status') or ''
+                    cache_safe_statuses = {'completed'}
+
+                    # 已取消可能是中间事件误判，后续同单消息仍需重新读取状态。
+                    if amount_valid and current_status in cache_safe_statuses:
+                        logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，状态为{current_status}，直接返回缓存数据")
                         print(f"[OK] 订单 {order_id} 使用缓存数据，跳过浏览器获取")
 
                         # 构建返回格式，与浏览器获取的格式保持一致
@@ -274,6 +277,8 @@ class OrderDetailFetcher:
                         if not amount_valid:
                             logger.info(f"[CLIPBOARD] 订单 {order_id} 存在于数据库中但金额无效({amount})，需要重新获取")
                             print(f"[WARNING]️ 订单 {order_id} 金额无效，重新获取详情...")
+                        else:
+                            logger.info(f"[CLIPBOARD] 订单 {order_id} 金额有效但状态为{current_status or 'unknown'}，需要重新获取最新状态")
 
                 # 只有在数据库中没有有效数据时才初始化浏览器
                 logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
@@ -787,11 +792,26 @@ class OrderDetailFetcher:
             status_info = await self.page.evaluate('''() => {
                 // 定义状态关键词映射 - 优先级高的放前面
                 const statusMap = [
+                    // 退款最终态
+                    {text: '退款成功，钱款已原路退返', status: 'cancelled', priority: 140},
+                    {text: '钱款已原路退返', status: 'cancelled', priority: 138},
                     // 交易关闭 - 最长最具体的优先
-                    {text: '买家取消了订单', status: 'cancelled', priority: 100},
-                    {text: '卖家取消了订单', status: 'cancelled', priority: 100},
-                    {text: '交易关闭', status: 'cancelled', priority: 90},
-                    {text: '订单已关闭', status: 'cancelled', priority: 90},
+                    {text: '未付款，买家关闭了订单', status: 'cancelled', priority: 135},
+                    {text: '未付款，买家关闭订单', status: 'cancelled', priority: 135},
+                    {text: '买家关闭了订单', status: 'cancelled', priority: 132},
+                    {text: '买家关闭订单', status: 'cancelled', priority: 132},
+                    {text: '买家取消了订单', status: 'cancelled', priority: 130},
+                    {text: '卖家取消了订单', status: 'cancelled', priority: 130},
+                    {text: '交易关闭', status: 'cancelled', priority: 125},
+                    {text: '订单已关闭', status: 'cancelled', priority: 125},
+                    // 退款处理中 - 必须高于已发货，否则售后页会被旧发货节点覆盖
+                    {text: '买家撤销退款申请', status: 'shipped', priority: 122},
+                    {text: '撤销退款申请', status: 'shipped', priority: 122},
+                    {text: '我发起了退款申请', status: 'refunding', priority: 120},
+                    {text: '退款申请', status: 'refunding', priority: 118},
+                    {text: '申请退款', status: 'refunding', priority: 116},
+                    {text: '退款中', status: 'refunding', priority: 114},
+                    {text: '退款协商', status: 'refunding', priority: 112},
                     // 已发货
                     {text: '卖家已发货，待买家确认收货', status: 'shipped', priority: 85},
                     {text: '已发货，待买家确认收货', status: 'shipped', priority: 80},
@@ -807,9 +827,6 @@ class OrderDetailFetcher:
                     {text: '交易成功', status: 'completed', priority: 40},
                     {text: '订单完成', status: 'completed', priority: 35},
                     {text: '交易完成', status: 'completed', priority: 30},
-                    // 退款
-                    {text: '退款中', status: 'refunding', priority: 25},
-                    {text: '申请退款', status: 'refunding', priority: 20},
                     // 处理中
                     {text: '处理中', status: 'processing', priority: 10},
                 ];
@@ -827,7 +844,7 @@ class OrderDetailFetcher:
                 const maxNodes = 5000; // 限制遍历的节点数量
 
                 let node;
-                while(node = walker.nextNode() && nodeCount < maxNodes) {
+                while((node = walker.nextNode()) && nodeCount < maxNodes) {
                     nodeCount++;
                     const text = node.textContent?.trim();
                     if(!text || text.length < 2 || text.length > 100) continue;
@@ -1033,9 +1050,12 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
             receiver_phone = existing_order.get('receiver_phone', '')
             receiver_address = existing_order.get('receiver_address', '')
 
-            # 只有金额有效时才使用缓存（不再检查收货人信息是否完整）
-            if amount_valid:
-                logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，直接返回缓存数据")
+            current_status = existing_order.get('order_status') or existing_order.get('status') or ''
+            cache_safe_statuses = {'completed'}
+
+            # 只有终态订单才因为金额有效直接使用缓存；待付款/待发货仍需重新读取状态。
+            if amount_valid and current_status in cache_safe_statuses:
+                logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效({amount})，状态为{current_status}，直接返回缓存数据")
                 print(f"[OK] 订单 {order_id} 使用缓存数据（金额:{amount}）")
 
                 # 构建返回格式（包含收货人信息）
@@ -1066,6 +1086,8 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
                 if not amount_valid:
                     logger.info(f"[CLIPBOARD] 订单 {order_id} 金额无效({amount})，需要重新获取")
                     print(f"[WARN] 订单 {order_id} 金额无效，重新获取详情...")
+                else:
+                    logger.info(f"[CLIPBOARD] 订单 {order_id} 金额有效但状态为{current_status or 'unknown'}，需要重新获取最新状态")
     except Exception as e:
         logger.warning(f"检查数据库缓存失败: {e}")
 

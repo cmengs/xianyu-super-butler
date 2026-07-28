@@ -8,6 +8,7 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   const styles = {
     processing: 'bg-yellow-100 text-yellow-800',
+    pending_payment: 'bg-orange-100 text-orange-700',
     pending_ship: 'bg-[#FFE815] text-black',
     shipped: 'bg-blue-100 text-blue-700',
     completed: 'bg-green-100 text-green-700',
@@ -17,6 +18,7 @@ const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
 
   const labels = {
     processing: '处理中',
+    pending_payment: '待付款',
     pending_ship: '待发货',
     shipped: '已发货',
     completed: '已完成',

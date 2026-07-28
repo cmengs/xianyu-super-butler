@@ -34,7 +34,8 @@ class OrderStatusHandler:
     # 4. 退款中的订单可以设置为已完成（因为买家可能取消退款）
     # 5. 只有退款完成才设置为已关闭
     VALID_TRANSITIONS = {
-        'processing': ['pending_ship', 'shipped', 'completed', 'cancelled'],
+        'processing': ['pending_payment', 'pending_ship', 'shipped', 'completed', 'cancelled'],
+        'pending_payment': ['pending_ship', 'cancelled'],
         'pending_ship': ['shipped', 'completed', 'cancelled', 'refunding'],  # 已付款，可以退款
         'shipped': ['completed', 'cancelled', 'refunding'],  # 已发货，可以退款
         'completed': ['cancelled', 'refunding'],  # 已完成，可以退款
@@ -50,6 +51,7 @@ class OrderStatusHandler:
         
         self.status_mapping = {
             'processing': '处理中',     # 初始状态/基本信息阶段
+            'pending_payment': '待付款', # 买家已拍下，等待付款
             'pending_ship': '待发货',   # 已付款，等待发货
             'shipped': '已发货',        # 发货确认后
             'completed': '已完成',      # 交易完成
@@ -85,6 +87,15 @@ class OrderStatusHandler:
             
             # 先查看消息的完整结构
             logger.info(f"🔍 完整消息结构: {message}")
+
+            direct_data = message.get('3') if isinstance(message, dict) else None
+            if isinstance(direct_data, dict):
+                for direct_key in ('orderId', 'order_id', 'bizOrderId'):
+                    candidate = str(direct_data.get(direct_key) or '').strip()
+                    if candidate.isdigit() and len(candidate) >= 10:
+                        order_id = candidate
+                        logger.info(f'✅ 从顶层交易事件提取到订单ID: {order_id}')
+                        break
             
             # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
             message_1 = message.get('1', {})
@@ -297,8 +308,9 @@ class OrderStatusHandler:
                         logger.info(f"🔄 退款撤销，回退到上一次状态: {previous_status}")
                         new_status = previous_status
                     else:
-                        logger.warning(f"⚠️ 退款撤销但无法获取上一次状态，保持当前状态: {current_status}")
-                        new_status = current_status
+                        fallback_status = self._get_refund_cancelled_fallback_status(order_id, current_status)
+                        logger.warning(f"⚠️ 退款撤销但无法获取上一次状态，按订单信息恢复为: {fallback_status}")
+                        new_status = fallback_status
                 
                 # 更新订单状态（带乐观锁和重试机制）
                 success = False
@@ -373,6 +385,16 @@ class OrderStatusHandler:
         if new_status == 'processing' and current_status in ['pending_ship', 'shipped', 'completed', 'refunding', 'refund_cancelled']:
             logger.warning(f"❌ 状态转换被拒绝：{current_status} -> {new_status} (已付款/已完成的订单不能回退到处理中)")
             return False
+
+        # 退款申请消息可能先被旧逻辑或详情页短暂识别为已关闭，允许纠正为退款中。
+        if current_status == 'cancelled' and new_status == 'refunding':
+            logger.warning(f"⚠️ 允许退款申请纠正状态：{current_status} -> {new_status}")
+            return True
+
+        # 旧逻辑可能把中间态误写为已关闭，真实交易事件到达后允许纠正回来。
+        if current_status == 'cancelled' and new_status in ('shipped', 'completed'):
+            logger.warning(f"⚠️ 允许真实交易事件纠正已关闭状态：{current_status} -> {new_status}")
+            return True
         
         # 检查新状态是否在允许的转换列表中
         allowed_statuses = self.VALID_TRANSITIONS.get(current_status, [])
@@ -391,6 +413,71 @@ class OrderStatusHandler:
             return ['所有状态']  # 兼容性
         
         return self.VALID_TRANSITIONS.get(current_status, [])
+
+    def _get_refund_cancelled_fallback_status(self, order_id: str, current_status: str = '') -> str:
+        """退款撤销时没有内存历史，按订单现有信息恢复状态。"""
+        if current_status in ('pending_ship', 'shipped', 'completed'):
+            return current_status
+
+        try:
+            from db_manager import db_manager
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                cursor.execute(
+                    "SELECT status_text, system_shipped FROM orders WHERE order_id = ? LIMIT 1",
+                    (order_id,)
+                )
+                row = cursor.fetchone()
+
+            status_text = str(row[0] or '') if row else ''
+            system_shipped = bool(row[1]) if row else False
+            clean_text = self._clean_refund_text(status_text)
+
+            if system_shipped or any(keyword in clean_text for keyword in ('已发货', '待买家确认收货')):
+                return 'shipped'
+            if any(keyword in clean_text for keyword in ('完成', '交易成功', '确认收货')):
+                return 'completed'
+            if any(keyword in clean_text for keyword in ('待发货', '等待卖家发货', '买家已付款', '付款完成')):
+                return 'pending_ship'
+        except Exception as e:
+            logger.warning(f"退款撤销恢复状态失败: {e}")
+
+        return 'pending_ship'
+
+    def _clean_refund_text(self, text: str) -> str:
+        return re.sub(r'\s+', '', str(text or '').strip().strip('[]'))
+
+    def _is_refund_final_text(self, text: str) -> bool:
+        clean_text = self._clean_refund_text(text)
+        return bool(clean_text and any(keyword in clean_text for keyword in (
+            '退款成功',
+            '钱款已原路退返',
+            '已原路退返',
+            '交易关闭',
+        )))
+
+    def _is_refund_reverted_text(self, text: str) -> bool:
+        clean_text = self._clean_refund_text(text)
+        return bool(clean_text and '退款' in clean_text and any(keyword in clean_text for keyword in (
+            '撤销',
+            '取消申请',
+            '关闭',
+            '拒绝',
+        )))
+
+    def _is_refund_active_text(self, text: str) -> bool:
+        clean_text = self._clean_refund_text(text)
+        if not clean_text or self._is_refund_final_text(clean_text) or self._is_refund_reverted_text(clean_text):
+            return False
+        return bool('退款' in clean_text and any(keyword in clean_text for keyword in (
+            '退款中',
+            '申请',
+            '发起',
+            '处理中',
+            '协商',
+            '售后',
+            '待处理',
+        )))
     
     def _check_refund_message(self, message: dict, send_message: str) -> Optional[str]:
         """检查退款申请消息，需要同时识别标题和按钮文本
@@ -403,6 +490,16 @@ class OrderStatusHandler:
             str: 对应的状态，如果不是退款消息则返回None
         """
         try:
+            if self._is_refund_final_text(send_message):
+                logger.info(f"✅ 识别到退款最终关闭消息: {send_message}")
+                return 'cancelled'
+            if self._is_refund_reverted_text(send_message):
+                logger.info(f"✅ 识别到退款撤销/关闭消息: {send_message}")
+                return 'refund_cancelled'
+            if self._is_refund_active_text(send_message):
+                logger.info(f"✅ 识别到退款申请/处理中消息: {send_message}")
+                return 'refunding'
+
             # 检查消息结构，寻找退款相关的信息
             message_1 = message.get('1', {})
             if not isinstance(message_1, dict):
@@ -439,16 +536,20 @@ class OrderStatusHandler:
                 button_text = ex_content.get('button', {}).get('text', '')
                 
                 logger.info(f"🔍 检查退款消息 - 标题: '{title}', 按钮: '{button_text}'")
+
+                combined_text = f"{title} {button_text}"
+                if self._is_refund_final_text(combined_text):
+                    logger.info(f"✅ 识别到退款最终关闭卡片")
+                    return 'cancelled'
+
+                if self._is_refund_reverted_text(combined_text):
+                    logger.info(f"✅ 识别到退款撤销/关闭卡片")
+                    return 'refund_cancelled'
                 
                 # 检查是否是退款申请且已同意
-                if title == '我发起了退款申请' and button_text == '已同意':
-                    logger.info(f"✅ 识别到退款申请已同意消息")
+                if self._is_refund_active_text(combined_text):
+                    logger.info(f"✅ 识别到退款申请/处理中卡片")
                     return 'refunding'
-                
-                # 检查是否是退款撤销（买家主动撤销）
-                if title == '我发起了退款申请' and button_text == '已撤销':
-                    logger.info(f"✅ 识别到退款撤销消息")
-                    return 'refund_cancelled'
                 
                 # 退款申请被拒绝不需要改变状态，因为没同意
                 # if title == '我发起了退款申请' and button_text == '已拒绝':
@@ -695,17 +796,31 @@ class OrderStatusHandler:
             # 定义消息类型与状态的映射
             message_status_mapping = {
                 '[买家确认收货，交易成功]': 'completed',
+                '买家确认收货，交易成功': 'completed',
+                '买家已确认收货，交易成功': 'completed',
                 '[你已确认收货，交易成功]': 'completed',  # 已完成
+                '你已确认收货，交易成功': 'completed',  # 已完成
                 '[你已发货]': 'shipped',  # 已发货
                 '你已发货': 'shipped',  # 已发货（无方括号）
                 '[你已发货，请等待买家确认收货]': 'shipped',  # 已发货（完整格式）
                 '[我已付款，等待你发货]': 'pending_ship',  # 已付款，等待发货
-                '[我已拍下，待付款]': 'processing',  # 已拍下，待付款
+                '[我已拍下，待付款]': 'pending_payment',  # 已拍下，待付款
+                '[等待买家付款]': 'pending_payment',
+                '等待买家付款': 'pending_payment',
+                '买家拍下了宝贝': 'pending_payment',
                 '[买家已付款]': 'pending_ship',  # 买家已付款
                 '[付款完成]': 'pending_ship',  # 付款完成
                 '[已付款，待发货]': 'pending_ship',  # 已付款，待发货
                 '[退款成功，钱款已原路退返]': 'cancelled',  # 退款成功，设置为已关闭
                 '[你关闭了订单，钱款已原路退返]': 'cancelled',  # 卖家关闭订单，设置为已关闭
+                '[未付款，买家关闭了订单]': 'cancelled',
+                '[未付款，买家关闭订单]': 'cancelled',
+                '未付款，买家关闭了订单': 'cancelled',
+                '未付款，买家关闭订单': 'cancelled',
+                '买家关闭了订单': 'cancelled',
+                '买家关闭订单': 'cancelled',
+                '买家已关闭交易': 'cancelled',
+                '交易关闭': 'cancelled',
             }
             
             # 特殊处理：检查退款申请消息（需要同时识别标题和按钮文本）
@@ -771,6 +886,7 @@ class OrderStatusHandler:
                 # 定义状态优先级（数字越大，状态越靠后）
                 status_priority = {
                     'processing': 1,      # 处理中
+                    'pending_payment': 1, # 待付款
                     'pending_ship': 2,    # 待发货
                     'shipped': 3,         # 已发货
                     'completed': 4,       # 已完成
@@ -795,6 +911,16 @@ class OrderStatusHandler:
             )
             
             if success:
+                try:
+                    clean_status_text = str(send_message or '').strip().strip('[]')
+                    if clean_status_text:
+                        db_manager.insert_or_update_order(
+                            order_id=order_id,
+                            status_text=clean_status_text,
+                            cookie_id=cookie_id
+                        )
+                except Exception as status_text_e:
+                    logger.warning(f'[{msg_time}] 【{cookie_id}】保存订单状态文案失败: {status_text_e}')
                 status_text = self.status_mapping.get(new_status, new_status)
                 logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 状态已更新为{status_text}')
             else:
@@ -872,6 +998,15 @@ class OrderStatusHandler:
             )
             
             if success:
+                try:
+                    from db_manager import db_manager
+                    db_manager.insert_or_update_order(
+                        order_id=order_id,
+                        status_text=red_reminder,
+                        cookie_id=cookie_id
+                    )
+                except Exception as status_text_e:
+                    logger.warning(f'[{msg_time}] 【{cookie_id}】保存订单状态文案失败: {status_text_e}')
                 logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，订单 {order_id} 状态已更新为已关闭')
             else:
                 logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，但订单 {order_id} 状态更新失败')

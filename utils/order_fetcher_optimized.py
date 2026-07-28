@@ -7,7 +7,7 @@ import time
 import json
 import re
 from typing import Dict, Any, Optional, List
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 from loguru import logger
 from collections import defaultdict
 
@@ -97,9 +97,12 @@ class OrderFetcherOptimized:
                     receiver_phone = existing_order.get('receiver_phone', '')
                     receiver_address = existing_order.get('receiver_address', '')
 
-                    # 只有在非强制刷新且金额有效时才使用缓存（状态检测需要真实访问页面）
-                    if amount_valid and not force_refresh:
-                        logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效，直接返回缓存数据")
+                    current_status = existing_order.get('order_status') or existing_order.get('status') or ''
+                    cache_safe_statuses = {'completed'}
+
+                    # 已取消可能是中间事件误判，后续同单消息仍需重新读取状态。
+                    if amount_valid and not force_refresh and current_status in cache_safe_statuses:
+                        logger.info(f"[CLIPBOARD] 订单 {order_id} 已存在于数据库中且金额有效，状态为{current_status}，直接返回缓存数据")
                         print(f"[OK] 订单 {order_id} 使用缓存数据")
 
                         result = {
@@ -129,6 +132,10 @@ class OrderFetcherOptimized:
                         if not amount_valid:
                             logger.info(f"[CLIPBOARD] 订单 {order_id} 金额无效({amount})，需要重新获取")
                             print(f"[WARNING] Order {order_id} amount invalid, refetching...")
+                        elif force_refresh:
+                            logger.info(f"[CLIPBOARD] 订单 {order_id} 强制刷新，跳过缓存")
+                        else:
+                            logger.info(f"[CLIPBOARD] 订单 {order_id} 金额有效但状态为{current_status or 'unknown'}，需要重新获取最新状态")
 
                 # 获取浏览器实例（使用浏览器池或创建新实例）
                 if self.use_pool:
@@ -145,39 +152,36 @@ class OrderFetcherOptimized:
                     logger.error("非池模式暂未实现")
                     return None
 
-                # 重置API响应列表
-                self.api_responses = []
-
-                # 设置路由拦截器（拦截API响应）
-                async def handle_route(route, request):
-                    """拦截网络请求"""
-                    # 拦截订单详情API
-                    if 'mtop.idle.web.trade.order.detail' in request.url:
-                        logger.info(f"[拦截] 发现订单详情API请求")
-
-                        # 继续请求并获取响应
-                        response = await route.fetch()
-                        body = await response.body()
-
-                        try:
-                            result = json.loads(body)
-                            self.api_responses.append(result)
-                            logger.info(f"[拦截] API响应已保存")
-                        except Exception as e:
-                            logger.error(f"解析API响应失败: {e}")
-
-                    # 继续所有请求
-                    await route.continue_()
-
-                # 设置路由拦截
-                await self.page.route('**/*', handle_route)
-
                 # 访问订单详情页面
                 url = f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller"
                 logger.info(f"访问订单详情页面: {url}")
                 # print(f"[BROWSER] Accessing page: {url}")  # 已移除
 
-                response = await self.page.goto(url, wait_until='networkidle', timeout=timeout * 1000)
+                self.api_responses = []
+                api_response_future = asyncio.get_running_loop().create_future()
+
+                async def capture_order_detail_response(api_response):
+                    if 'mtop.idle.web.trade.order.detail' not in api_response.url:
+                        return
+
+                    try:
+                        api_body = await api_response.text()
+                        parsed_response = self._parse_mtop_response_text(api_body)
+                        self.api_responses.append(parsed_response)
+                        if not api_response_future.done():
+                            api_response_future.set_result(parsed_response)
+                        logger.info("[ORDER_FETCH] order detail API response captured")
+                    except Exception as e:
+                        logger.warning(f"[ORDER_FETCH] failed to read order detail API response, fallback to DOM: {e}")
+                        if not api_response_future.done():
+                            api_response_future.set_result(None)
+
+                def on_response(api_response):
+                    asyncio.create_task(capture_order_detail_response(api_response))
+
+                self.page.on('response', on_response)
+
+                response = await self.page.goto(url, wait_until='domcontentloaded', timeout=timeout * 1000)
 
                 if not response or response.status != 200:
                     logger.error(f"页面访问失败，状态码: {response.status if response else 'None'}")
@@ -187,13 +191,35 @@ class OrderFetcherOptimized:
 
                 # 等待API响应和页面渲染
                 logger.info("等待API响应和页面渲染...")
-                await asyncio.sleep(2)
+                try:
+                    await asyncio.wait_for(asyncio.shield(api_response_future), timeout=max(timeout, 30))
+                    logger.info("[拦截] 订单详情API响应已保存")
+                except asyncio.TimeoutError:
+                    logger.warning("等待订单详情API响应超时，仅使用DOM解析数据")
+                except Exception as e:
+                    logger.warning(f"读取订单详情API响应失败，仅使用DOM解析数据: {e}")
+
+                await asyncio.sleep(1)
 
                 # 快速滚动，触发延迟加载的内容
                 await self.page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                 await asyncio.sleep(0.5)
                 await self.page.evaluate('window.scrollTo(0, 0)')
                 await asyncio.sleep(1)
+
+                if not self.api_responses and not api_response_future.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(api_response_future), timeout=5)
+                        logger.info("[拦截] 滚动后订单详情API响应已保存")
+                    except asyncio.TimeoutError:
+                        logger.warning("滚动后仍未等到订单详情API响应，仅使用DOM解析数据")
+                    except Exception as e:
+                        logger.warning(f"滚动后读取订单详情API响应失败，仅使用DOM解析数据: {e}")
+
+                try:
+                    self.page.remove_listener('response', on_response)
+                except Exception:
+                    pass
 
                 # 解析API响应数据
                 api_data = {}
@@ -241,15 +267,16 @@ class OrderFetcherOptimized:
                 result['status_text'] = api_data.get('status_text', '')
                 result['item_title'] = api_data.get('item_title', '')
                 result['buyer_id'] = api_data.get('buyer_id', '')
+                result['buyer_nick'] = api_data.get('buyer_nick', '')
                 result['item_id'] = api_data.get('item_id', '')
                 result['can_rate'] = api_data.get('can_rate', False)
 
                 # 从DOM获取的数据（更可靠）
                 result['spec_name'] = dom_data.get('spec_name', '')
                 result['spec_value'] = dom_data.get('spec_value', '')
-                result['quantity'] = dom_data.get('quantity', '1')
-                result['amount'] = dom_data.get('amount', api_data.get('price', ''))
-                result['order_time'] = dom_data.get('order_time', '')
+                result['quantity'] = dom_data.get('quantity', api_data.get('quantity', '1'))
+                result['amount'] = dom_data.get('amount', api_data.get('amount') or api_data.get('price', ''))
+                result['order_time'] = dom_data.get('order_time', api_data.get('order_time', ''))
                 result['receiver_name'] = dom_data.get('receiver_name', api_data.get('receiver_name', ''))
                 result['receiver_phone'] = dom_data.get('receiver_phone', api_data.get('receiver_phone', ''))
                 result['receiver_address'] = dom_data.get('receiver_address', api_data.get('receiver_address', ''))
@@ -274,6 +301,16 @@ class OrderFetcherOptimized:
                         logger.debug(f"关闭页面失败: {e}")
                     self.page = None
 
+    def _parse_mtop_response_text(self, response_text: str) -> Dict[str, Any]:
+        """Parse JSON or JSONP returned by Xianyu mtop endpoints."""
+        text = (response_text or '').strip()
+        if text.startswith('mtopjsonp'):
+            start = text.find('(')
+            end = text.rfind(')')
+            if start != -1 and end != -1 and end > start:
+                text = text[start + 1:end]
+        return json.loads(text)
+
     def _parse_api_response(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         解析API响应数据
@@ -289,10 +326,12 @@ class OrderFetcherOptimized:
         try:
             # 定义状态码映射（与 reply_server.py 保持一致）
             STATUS_CODE_MAP = {
-                '1': 'processing',
+                '1': 'pending_payment',
                 '2': 'pending_ship',
                 '3': 'shipped',
                 '4': 'completed',
+                '5': 'refunding',
+                '6': 'cancelled',
                 '7': 'refunding',
                 '8': 'cancelled',
                 '9': 'refunding',
@@ -315,24 +354,97 @@ class OrderFetcherOptimized:
                 # 是数字，需要映射
                 result['order_status'] = STATUS_CODE_MAP.get(str(status_code), 'unknown')
 
-            result['status_text'] = order_data.get('utArgs', {}).get('orderStatusName', '')
+            ut_args = order_data.get('utArgs', {}) or {}
+            result['status_text'] = (
+                ut_args.get('orderMainTitle')
+                or ut_args.get('orderStatusName')
+                or ''
+            )
+            clean_status_text = re.sub(r'\s+', '', result['status_text'])
+            if clean_status_text:
+                if any(keyword in clean_status_text for keyword in ('退款成功', '钱款已原路退返', '已原路退返', '交易关闭')):
+                    result['order_status'] = 'cancelled'
+                elif (
+                    '退款' in clean_status_text
+                    and any(keyword in clean_status_text for keyword in ('申请', '发起', '处理中', '协商', '售后', '待处理'))
+                    and not any(keyword in clean_status_text for keyword in ('撤销', '取消申请', '关闭', '拒绝', '成功'))
+                ):
+                    result['order_status'] = 'refunding'
+                elif '退款' in clean_status_text and any(keyword in clean_status_text for keyword in ('撤销', '取消申请', '关闭', '拒绝')):
+                    result['order_status'] = 'shipped'
+                elif any(keyword in clean_status_text for keyword in ('关闭', '取消')):
+                    result['order_status'] = 'cancelled'
+            result['buyer_id'] = str(order_data.get('peerUserId') or '')
+            result['item_id'] = str(order_data.get('itemId') or '')
 
             # 提取商品信息
             components = order_data.get('components', [])
             for component in components:
-                if component.get('render') == 'orderInfoVO':
+                render = component.get('render')
+                data = component.get('data', {}) or {}
+
+                if render == 'orderStatusVO':
+                    status_info = data.get('orderStatusInfo', {}) or {}
+                    status_title = status_info.get('title') or ''
+                    if status_title:
+                        result['status_text'] = status_title
+                        clean_status_title = re.sub(r'\s+', '', status_title)
+                        if any(keyword in clean_status_title for keyword in ('退款成功', '钱款已原路退返', '已原路退返', '交易关闭')):
+                            result['order_status'] = 'cancelled'
+                        elif (
+                            '退款' in clean_status_title
+                            and any(keyword in clean_status_title for keyword in ('申请', '发起', '处理中', '协商', '售后', '待处理'))
+                            and not any(keyword in clean_status_title for keyword in ('撤销', '取消申请', '关闭', '拒绝', '成功'))
+                        ):
+                            result['order_status'] = 'refunding'
+                        elif '退款' in clean_status_title and any(keyword in clean_status_title for keyword in ('撤销', '取消申请', '关闭', '拒绝')):
+                            result['order_status'] = 'shipped'
+                        elif '关闭' in status_title or '取消' in status_title:
+                            result['order_status'] = 'cancelled'
+                        elif '待付款' in status_title or '等待买家付款' in status_title:
+                            result['order_status'] = 'pending_payment'
+                        elif '待发货' in status_title or '买家已付款' in status_title:
+                            result['order_status'] = 'pending_ship'
+                        elif '待收货' in status_title or '已发货' in status_title:
+                            result['order_status'] = 'shipped'
+                        elif '退款' in status_title:
+                            result['order_status'] = 'refunding'
+                        elif '完成' in status_title or '成功' in status_title:
+                            result['order_status'] = 'completed'
+
+                elif render == 'addressInfoVO':
+                    result['receiver_name'] = data.get('name', '') or ''
+                    result['receiver_phone'] = data.get('phoneNumber', '') or ''
+                    result['receiver_address'] = data.get('address', '') or ''
+
+                elif render == 'orderInfoVO':
                     # 商品信息
-                    item_info = component.get('data', {}).get('itemInfo', {})
-                    result['item_title'] = item_info.get('title', '')
-                    result['item_id'] = item_info.get('itemId', '')
+                    item_info = data.get('itemInfo', {}) or {}
+                    result['item_title'] = item_info.get('title', '') or ''
+                    result['item_id'] = str(item_info.get('itemId') or result.get('item_id') or '')
+                    result['quantity'] = item_info.get('buyAmount') or result.get('quantity') or '1'
 
                     # 价格信息
-                    price_info = component.get('data', {}).get('priceInfo', {})
-                    amount = price_info.get('amount', {})
-                    result['price'] = amount.get('value', '')
+                    price_info = data.get('priceInfo', {}) or {}
+                    amount = price_info.get('amount', {}) or {}
+                    result['amount'] = amount.get('value') or item_info.get('price') or ''
+                    result['price'] = result['amount']
+
+                    for bill in price_info.get('billList', []) or []:
+                        if bill.get('code') == 'ITEM_TOTAL_FEE' and not result.get('amount'):
+                            result['amount'] = bill.get('value', '')
+                            result['price'] = result['amount']
+
+                    for info in data.get('orderInfoList', []) or []:
+                        title = info.get('title', '')
+                        value = info.get('value', '')
+                        if title == '买家昵称':
+                            result['buyer_nick'] = value or ''
+                        elif title == '下单时间':
+                            result['order_time'] = value or ''
 
                     # 收货地址信息
-                    address_info = component.get('data', {}).get('addressInfo', {})
+                    address_info = data.get('addressInfo', {})
                     if address_info:
                         result['receiver_name'] = address_info.get('receiverName', '')
                         result['receiver_phone'] = address_info.get('receiverMobile', '')
@@ -353,8 +465,8 @@ class OrderFetcherOptimized:
                             result['receiver_address'] = ' '.join(address_parts)
 
                     # 买家ID
-                    buyer_info = component.get('data', {}).get('buyerInfo', {})
-                    result['buyer_id'] = buyer_info.get('userId', '')
+                    buyer_info = data.get('buyerInfo', {})
+                    result['buyer_id'] = str(buyer_info.get('userId') or result.get('buyer_id') or '')
 
             # 检查是否可评价
             bottom_bar = order_data.get('bottomBarVO', {})
@@ -427,12 +539,108 @@ class OrderFetcherOptimized:
 
             # 获取订单状态（使用JavaScript分析页面）
             result['order_status_dom'] = await self._get_order_status()
+            await self._parse_body_text_fallback(result)
             logger.info(f"DOM检测到的订单状态: {result['order_status_dom']}")
 
         except Exception as e:
             logger.error(f"解析DOM内容失败: {e}")
 
         return result
+
+    async def _parse_body_text_fallback(self, result: Dict[str, str]) -> None:
+        """从新版闲鱼订单详情页的可见文本中兜底提取字段。"""
+        try:
+            body_text = await self.page.inner_text('body')
+            lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+
+            def set_if_missing(key: str, value: str) -> None:
+                value = (value or '').strip()
+                if value and not result.get(key):
+                    result[key] = value
+
+            def next_value(label: str) -> str:
+                for i, line in enumerate(lines):
+                    if line == label or label in line:
+                        for candidate in lines[i + 1:i + 5]:
+                            if candidate not in {'复制', '查看', '修改价格', '取消订单', '联系卖家'}:
+                                return candidate
+                return ''
+
+            status_candidates = [
+                ('退款成功，钱款已原路退返', 'cancelled'),
+                ('钱款已原路退返', 'cancelled'),
+                ('未付款，买家关闭了订单', 'cancelled'),
+                ('未付款，买家关闭订单', 'cancelled'),
+                ('买家关闭了订单', 'cancelled'),
+                ('买家关闭订单', 'cancelled'),
+                ('交易关闭', 'cancelled'),
+                ('订单已关闭', 'cancelled'),
+                ('买家取消', 'cancelled'),
+                ('卖家取消', 'cancelled'),
+                ('买家撤销退款申请', 'shipped'),
+                ('撤销退款申请', 'shipped'),
+                ('我发起了退款申请', 'refunding'),
+                ('退款申请', 'refunding'),
+                ('申请退款', 'refunding'),
+                ('退款中', 'refunding'),
+                ('退款协商', 'refunding'),
+                ('等待买家付款', 'pending_payment'),
+                ('买家拍下了宝贝', 'pending_payment'),
+                ('买家已付款', 'pending_ship'),
+                ('等待卖家发货', 'pending_ship'),
+                ('卖家已发货', 'shipped'),
+                ('待买家确认收货', 'shipped'),
+                ('交易成功', 'completed'),
+                ('订单完成', 'completed'),
+                ('交易完成', 'completed'),
+            ]
+            if result.get('order_status_dom') in (None, '', 'unknown'):
+                for text, status in status_candidates:
+                    if text in body_text:
+                        result['order_status_dom'] = status
+                        set_if_missing('status_text', text)
+                        break
+
+            buyer_nick = next_value('买家昵称')
+            set_if_missing('buyer_nick', buyer_nick)
+
+            order_time = next_value('下单时间')
+            time_match = re.search(r'\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}(?::\d{2})?', order_time)
+            if time_match:
+                set_if_missing('order_time', time_match.group(0).replace('/', '-'))
+
+            for amount_label in ('成交价', '实付金额', '商品总价'):
+                amount_text = next_value(amount_label)
+                amount_match = re.search(r'¥?\s*\d+(?:\.\d+)?', amount_text)
+                if amount_match:
+                    set_if_missing('amount', amount_match.group(0).replace(' ', ''))
+                    break
+
+            for i, line in enumerate(lines):
+                if '收货信息' not in line and '收货地址' not in line:
+                    continue
+
+                window = lines[i + 1:i + 10]
+                for idx, candidate in enumerate(window):
+                    phone_match = re.search(r'1[3-9]\d[\d\*]{8}', candidate)
+                    if phone_match:
+                        before_phone = candidate[:phone_match.start()].strip()
+                        after_phone = candidate[phone_match.end():].strip()
+                        if before_phone:
+                            set_if_missing('receiver_name', before_phone)
+                        elif idx > 0:
+                            set_if_missing('receiver_name', window[idx - 1])
+
+                        set_if_missing('receiver_phone', phone_match.group(0))
+
+                        if after_phone:
+                            set_if_missing('receiver_address', after_phone)
+                        elif idx + 1 < len(window):
+                            set_if_missing('receiver_address', window[idx + 1])
+                        return
+
+        except Exception as e:
+            logger.debug(f"页面文本兜底解析失败: {e}")
 
     async def _get_order_time(self, result: Dict[str, str]) -> None:
         """获取订单创建时间"""
@@ -470,10 +678,11 @@ class OrderFetcherOptimized:
     async def _get_receiver_info(self, result: Dict[str, str]) -> None:
         """获取收货人信息"""
         try:
-            # 方法1: 查找"收货地址"标签
-            address_label = await self.page.query_selector('text=/收货地址/')
+            # 方法1: 查找"收货地址/收货信息"标签
+            address_label = await self.page.query_selector('text=/收货地址|收货信息/')
             if address_label:
-                parent_li = await address_label.evaluate_handle('el => el.closest("li")')
+                parent_handle = await address_label.evaluate_handle('el => el.closest("li")')
+                parent_li = parent_handle.as_element() if parent_handle else None
                 if parent_li:
                     address_span = await parent_li.query_selector('span.textItemValue--w9qCWO1o')
                     if not address_span:
@@ -507,7 +716,7 @@ class OrderFetcherOptimized:
             body_text = await self.page.inner_text('body')
             lines = body_text.split('\n')
             for i, line in enumerate(lines):
-                if '收货地址' in line and i + 1 < len(lines):
+                if ('收货地址' in line or '收货信息' in line) and i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
                     phone_match = re.search(r'1[3-9]\d[\d\*]{8}', next_line)
                     if phone_match:
@@ -526,11 +735,29 @@ class OrderFetcherOptimized:
             status_info = await self.page.evaluate('''() => {
                 // 定义状态关键词映射 - 优先级高的放前面
                 const statusMap = [
+                    // 退款最终态
+                    {text: '退款成功，钱款已原路退返', status: 'cancelled', priority: 140},
+                    {text: '钱款已原路退返', status: 'cancelled', priority: 138},
+                    // 待付款
+                    {text: '等待买家付款', status: 'pending_payment', priority: 95},
+                    {text: '买家拍下了宝贝', status: 'pending_payment', priority: 92},
                     // 交易关闭 - 最长最具体的优先
-                    {text: '买家取消了订单', status: 'cancelled', priority: 100},
-                    {text: '卖家取消了订单', status: 'cancelled', priority: 100},
-                    {text: '交易关闭', status: 'cancelled', priority: 90},
-                    {text: '订单已关闭', status: 'cancelled', priority: 90},
+                    {text: '未付款，买家关闭了订单', status: 'cancelled', priority: 135},
+                    {text: '未付款，买家关闭订单', status: 'cancelled', priority: 135},
+                    {text: '买家关闭了订单', status: 'cancelled', priority: 132},
+                    {text: '买家关闭订单', status: 'cancelled', priority: 132},
+                    {text: '买家取消了订单', status: 'cancelled', priority: 130},
+                    {text: '卖家取消了订单', status: 'cancelled', priority: 130},
+                    {text: '交易关闭', status: 'cancelled', priority: 125},
+                    {text: '订单已关闭', status: 'cancelled', priority: 125},
+                    // 退款处理中 - 必须高于已发货，否则售后页会被旧发货节点覆盖
+                    {text: '买家撤销退款申请', status: 'shipped', priority: 122},
+                    {text: '撤销退款申请', status: 'shipped', priority: 122},
+                    {text: '我发起了退款申请', status: 'refunding', priority: 120},
+                    {text: '退款申请', status: 'refunding', priority: 118},
+                    {text: '申请退款', status: 'refunding', priority: 116},
+                    {text: '退款中', status: 'refunding', priority: 114},
+                    {text: '退款协商', status: 'refunding', priority: 112},
                     // 已发货
                     {text: '卖家已发货，待买家确认收货', status: 'shipped', priority: 85},
                     {text: '已发货，待买家确认收货', status: 'shipped', priority: 80},
@@ -546,9 +773,6 @@ class OrderFetcherOptimized:
                     {text: '交易成功', status: 'completed', priority: 40},
                     {text: '订单完成', status: 'completed', priority: 35},
                     {text: '交易完成', status: 'completed', priority: 30},
-                    // 退款
-                    {text: '退款中', status: 'refunding', priority: 25},
-                    {text: '申请退款', status: 'refunding', priority: 20},
                     // 处理中
                     {text: '处理中', status: 'processing', priority: 10},
                 ];

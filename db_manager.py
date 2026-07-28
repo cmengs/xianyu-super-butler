@@ -222,11 +222,18 @@ class DBManager:
                 order_id TEXT PRIMARY KEY,
                 item_id TEXT,
                 buyer_id TEXT,
+                buyer_nick TEXT DEFAULT '',
                 spec_name TEXT,
                 spec_value TEXT,
                 quantity TEXT,
                 amount TEXT,
                 order_status TEXT DEFAULT 'unknown',
+                status_text TEXT DEFAULT '',
+                review_status TEXT DEFAULT '',
+                seller_review_status TEXT DEFAULT '',
+                buyer_review_status TEXT DEFAULT '',
+                refund_reason TEXT DEFAULT '',
+                refund_description TEXT DEFAULT '',
                 cookie_id TEXT,
                 is_bargain INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -254,6 +261,62 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_phone TEXT DEFAULT ''")
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_address TEXT DEFAULT ''")
                 logger.info("orders 表收货人信息列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT receiver_city FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 receiver_city 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_city TEXT DEFAULT ''")
+                logger.info("orders 表 receiver_city 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT buyer_nick FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 buyer_nick 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN buyer_nick TEXT DEFAULT ''")
+                logger.info("orders 表 buyer_nick 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT status_text FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 status_text 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN status_text TEXT DEFAULT ''")
+                logger.info("orders 表 status_text 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT review_status FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 review_status 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN review_status TEXT DEFAULT ''")
+                logger.info("orders 表 review_status 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT seller_review_status FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 seller_review_status 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN seller_review_status TEXT DEFAULT ''")
+                logger.info("orders 表 seller_review_status 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT buyer_review_status FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 buyer_review_status 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN buyer_review_status TEXT DEFAULT ''")
+                logger.info("orders 表 buyer_review_status 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT refund_reason FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 refund_reason 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN refund_reason TEXT DEFAULT ''")
+                logger.info("orders 表 refund_reason 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT refund_description FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 refund_description 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN refund_description TEXT DEFAULT ''")
+                logger.info("orders 表 refund_description 列添加完成")
 
             # 检查并添加 version 列（用于乐观锁）
             try:
@@ -310,6 +373,7 @@ class DBManager:
                 item_description TEXT,
                 item_category TEXT,
                 item_price TEXT,
+                item_image TEXT,
                 item_detail TEXT,
                 is_multi_spec BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -327,6 +391,13 @@ class DBManager:
                 logger.info("正在为 item_info 表添加 multi_quantity_delivery 列...")
                 self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN multi_quantity_delivery BOOLEAN DEFAULT FALSE")
                 logger.info("item_info 表 multi_quantity_delivery 列添加完成")
+
+            try:
+                self._execute_sql(cursor, "SELECT item_image FROM item_info LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 item_info 表添加 item_image 列...")
+                self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN item_image TEXT")
+                logger.info("item_info 表 item_image 列添加完成")
 
             # 创建自动发货规则表
             cursor.execute('''
@@ -780,6 +851,12 @@ class DBManager:
                     self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN multi_quantity_delivery BOOLEAN DEFAULT FALSE")
                     logger.info("为item_info表添加多数量发货字段")
 
+                try:
+                    self._execute_sql(cursor, "SELECT item_image FROM item_info LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN item_image TEXT")
+                    logger.info("为item_info表添加商品图片字段")
+
                 # 检查orders表是否有is_bargain字段
                 try:
                     self._execute_sql(cursor, "SELECT is_bargain FROM orders LIMIT 1")
@@ -811,6 +888,54 @@ class DBManager:
                     # receiver_address字段不存在，需要添加
                     self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_address TEXT")
                     logger.info("为orders表添加receiver_address字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT receiver_city FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN receiver_city TEXT")
+                    logger.info("为orders表添加receiver_city字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT buyer_nick FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN buyer_nick TEXT")
+                    logger.info("为orders表添加buyer_nick字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT status_text FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN status_text TEXT")
+                    logger.info("为orders表添加status_text字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT review_status FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN review_status TEXT DEFAULT ''")
+                    logger.info("为orders表添加review_status字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT seller_review_status FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN seller_review_status TEXT DEFAULT ''")
+                    logger.info("为orders表添加seller_review_status字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT buyer_review_status FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN buyer_review_status TEXT DEFAULT ''")
+                    logger.info("为orders表添加buyer_review_status字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT refund_reason FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN refund_reason TEXT DEFAULT ''")
+                    logger.info("为orders表添加refund_reason字段")
+
+                try:
+                    self._execute_sql(cursor, "SELECT refund_description FROM orders LIMIT 1")
+                except sqlite3.OperationalError:
+                    self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN refund_description TEXT DEFAULT ''")
+                    logger.info("为orders表添加refund_description字段")
 
                 # 检查orders表是否有system_shipped字段（系统是否已发货）
                 try:
@@ -3744,11 +3869,64 @@ class DBManager:
                 self.conn.rollback()
                 return None
 
+    def _extract_item_image_from_payload(self, payload: Optional[Dict]) -> str:
+        """Extract the first product image URL from Xianyu item payloads."""
+        if not isinstance(payload, dict):
+            return ''
+
+        pic_info = payload.get('pic_info') or payload.get('picInfo') or {}
+        if isinstance(pic_info, dict):
+            for key in ('picUrl', 'pic_url', 'url', 'imageUrl', 'image_url'):
+                value = pic_info.get(key)
+                if value:
+                    return value
+
+            for key in ('picList', 'images', 'list'):
+                pic_list = pic_info.get(key)
+                if isinstance(pic_list, list) and pic_list:
+                    first = pic_list[0]
+                    if isinstance(first, str):
+                        return first
+                    if isinstance(first, dict):
+                        for image_key in ('picUrl', 'pic_url', 'url', 'imageUrl', 'image_url'):
+                            value = first.get(image_key)
+                            if value:
+                                return value
+
+        for key in ('item_image', 'image', 'image_url', 'pic_url', 'picUrl'):
+            value = payload.get(key)
+            if value:
+                return value
+
+        return ''
+
+    def _hydrate_item_response(self, item_info: Dict) -> Dict:
+        """Normalize item fields for API responses without changing stored data."""
+        detail = item_info.get('item_detail') or ''
+        parsed_detail = {}
+
+        if detail:
+            try:
+                parsed_detail = json.loads(detail)
+            except Exception:
+                item_info['item_detail_text'] = detail
+
+        item_info['item_detail_parsed'] = parsed_detail if isinstance(parsed_detail, dict) else {}
+
+        if not item_info.get('item_description') and item_info.get('item_detail_text'):
+            item_info['item_description'] = item_info['item_detail_text']
+
+        if not item_info.get('item_image'):
+            item_info['item_image'] = self._extract_item_image_from_payload(item_info['item_detail_parsed'])
+
+        return item_info
+
     # ==================== 商品信息管理 ====================
 
     def save_item_basic_info(self, cookie_id: str, item_id: str, item_title: str = None,
-                            item_description: str = None, item_category: str = None,
-                            item_price: str = None, item_detail: str = None) -> bool:
+                             item_description: str = None, item_category: str = None,
+                             item_price: str = None, item_detail: str = None,
+                             item_image: str = None) -> bool:
         """保存或更新商品基本信息，使用原子操作避免并发问题
 
         Args:
@@ -3771,10 +3949,10 @@ class DBManager:
                 # 首先尝试插入，如果已存在则忽略
                 cursor.execute('''
                 INSERT OR IGNORE INTO item_info (cookie_id, item_id, item_title, item_description,
-                                               item_category, item_price, item_detail, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                                               item_category, item_price, item_image, item_detail, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ''', (cookie_id, item_id, item_title or '', item_description or '',
-                      item_category or '', item_price or '', item_detail or ''))
+                      item_category or '', item_price or '', item_image or '', item_detail or ''))
 
                 # 如果是新插入的记录，直接返回成功
                 if cursor.rowcount > 0:
@@ -3802,6 +3980,10 @@ class DBManager:
                 if item_price:
                     update_parts.append("item_price = CASE WHEN (item_price IS NULL OR item_price = '') THEN ? ELSE item_price END")
                     params.append(item_price)
+
+                if item_image:
+                    update_parts.append("item_image = CASE WHEN (item_image IS NULL OR item_image = '') THEN ? ELSE item_image END")
+                    params.append(item_image)
 
                 # 对于item_detail，只有在现有值为空时才更新
                 if item_detail:
@@ -3880,16 +4062,18 @@ class DBManager:
                             ''', (item_data, cookie_id, item_id))
                         else:
                             # 处理字典类型的详情数据（向后兼容）
+                            item_image = self._extract_item_image_from_payload(item_data)
                             cursor.execute('''
                             UPDATE item_info SET
                                 item_title = ?, item_description = ?, item_category = ?,
-                                item_price = ?, item_detail = ?, updated_at = CURRENT_TIMESTAMP
+                                item_price = ?, item_image = ?, item_detail = ?, updated_at = CURRENT_TIMESTAMP
                             WHERE cookie_id = ? AND item_id = ?
                             ''', (
                                 item_data.get('title', ''),
                                 item_data.get('description', ''),
                                 item_data.get('category', ''),
                                 item_data.get('price', ''),
+                                item_image,
                                 json.dumps(item_data, ensure_ascii=False),
                                 cookie_id, item_id
                             ))
@@ -3908,16 +4092,18 @@ class DBManager:
                         ''', (cookie_id, item_id, item_data))
                     else:
                         # 处理字典类型的详情数据（向后兼容）
+                        item_image = self._extract_item_image_from_payload(item_data)
                         cursor.execute('''
                         INSERT INTO item_info (cookie_id, item_id, item_title, item_description,
-                                             item_category, item_price, item_detail)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                             item_category, item_price, item_image, item_detail)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             cookie_id, item_id,
                             item_data.get('title', '') if item_data else '',
                             item_data.get('description', '') if item_data else '',
                             item_data.get('category', '') if item_data else '',
                             item_data.get('price', '') if item_data else '',
+                            item_image,
                             json.dumps(item_data, ensure_ascii=False) if item_data else ''
                         ))
                     logger.info(f"新增商品信息: {item_id}")
@@ -3953,12 +4139,7 @@ class DBManager:
                     columns = [description[0] for description in cursor.description]
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
+                    item_info = self._hydrate_item_response(item_info)
                     logger.info(f"item_info: {item_info}")
                     return item_info
                 return None
@@ -4077,12 +4258,7 @@ class DBManager:
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
+                    item_info = self._hydrate_item_response(item_info)
 
                     items.append(item_info)
 
@@ -4112,12 +4288,7 @@ class DBManager:
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
 
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
+                    item_info = self._hydrate_item_response(item_info)
 
                     items.append(item_info)
 
@@ -4144,9 +4315,14 @@ class DBManager:
                 # 只更新item_detail字段，不影响其他字段
                 cursor.execute('''
                 UPDATE item_info SET
-                    item_detail = ?, updated_at = CURRENT_TIMESTAMP
+                    item_detail = ?,
+                    item_description = CASE
+                        WHEN (item_description IS NULL OR item_description = '') AND ? != '' THEN ?
+                        ELSE item_description
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE cookie_id = ? AND item_id = ?
-                ''', (item_detail, cookie_id, item_id))
+                ''', (item_detail, item_detail or '', item_detail or '', cookie_id, item_id))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
@@ -4230,6 +4406,7 @@ class DBManager:
                         item_description = item_data.get('item_description', '')
                         item_category = item_data.get('item_category', '')
                         item_price = item_data.get('item_price', '')
+                        item_image = item_data.get('item_image', '')
                         item_detail = item_data.get('item_detail', '')
 
                         if not cookie_id or not item_id:
@@ -4243,10 +4420,10 @@ class DBManager:
                         # 使用 INSERT OR IGNORE + UPDATE 模式
                         cursor.execute('''
                         INSERT OR IGNORE INTO item_info (cookie_id, item_id, item_title, item_description,
-                                                       item_category, item_price, item_detail, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                                                       item_category, item_price, item_image, item_detail, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ''', (cookie_id, item_id, item_title, item_description,
-                              item_category, item_price, item_detail))
+                              item_category, item_price, item_image, item_detail))
 
                         if cursor.rowcount == 0:
                             # 记录已存在，进行条件更新
@@ -4256,6 +4433,7 @@ class DBManager:
                                 item_description = CASE WHEN (item_description IS NULL OR item_description = '') AND ? != '' THEN ? ELSE item_description END,
                                 item_category = CASE WHEN (item_category IS NULL OR item_category = '') AND ? != '' THEN ? ELSE item_category END,
                                 item_price = CASE WHEN (item_price IS NULL OR item_price = '') AND ? != '' THEN ? ELSE item_price END,
+                                item_image = CASE WHEN (item_image IS NULL OR item_image = '') AND ? != '' THEN ? ELSE item_image END,
                                 item_detail = CASE WHEN (item_detail IS NULL OR item_detail = '' OR TRIM(item_detail) = '') AND ? != '' THEN ? ELSE item_detail END,
                                 updated_at = CURRENT_TIMESTAMP
                             WHERE cookie_id = ? AND item_id = ?
@@ -4265,6 +4443,7 @@ class DBManager:
                                 item_description, item_description,
                                 item_category, item_category,
                                 item_price, item_price,
+                                item_image, item_image,
                                 item_detail, item_detail,
                                 cookie_id, item_id
                             ))
@@ -4574,7 +4753,11 @@ class DBManager:
                               is_bargain: bool = None, created_at: str = None, receiver_name: str = None,
                               receiver_phone: str = None, receiver_address: str = None,
                               system_shipped: bool = None, expected_version: int = None,
-                              chat_id: str = None):
+                              chat_id: str = None, receiver_city: str = None,
+                              buyer_nick: str = None, status_text: str = None,
+                              review_status: str = None, seller_review_status: str = None,
+                              buyer_review_status: str = None, refund_reason: str = None,
+                              refund_description: str = None, **extra_fields):
         """插入或更新订单信息"""
         with self.lock:
             try:
@@ -4589,20 +4772,206 @@ class DBManager:
                         return False
 
                 # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute(
+                    "SELECT order_id, item_id, buyer_id, cookie_id, order_status FROM orders WHERE order_id = ?",
+                    (order_id,)
+                )
                 existing = cursor.fetchone()
+
+                def _is_blank(value) -> bool:
+                    return value is None or str(value).strip() == ''
+
+                def _normalize_price(value) -> str:
+                    value = str(value or '').strip()
+                    return value.replace('¥', '').replace('￥', '').strip()
+
+                def _clean_status_text(value) -> str:
+                    return str(value or '').strip().strip('[]').replace(' ', '')
+
+                def _infer_order_status_from_text(text: str):
+                    clean_text = _clean_status_text(text)
+                    if not clean_text:
+                        return None
+                    if any(keyword in clean_text for keyword in ('退款成功', '钱款已原路退返', '已原路退返', '交易关闭')):
+                        return 'cancelled'
+                    if '退款' in clean_text and any(keyword in clean_text for keyword in ('申请', '发起', '退款中', '处理中', '协商', '售后')):
+                        return 'refunding'
+                    if any(keyword in clean_text for keyword in ('快给ta一个评价', '快给TA一个评价', '评价吧', '交易成功', '买家确认收货', '买家已确认收货', '已评价', '评价成功', '评价完成', '完成了评价')):
+                        return 'completed'
+                    if any(keyword in clean_text for keyword in ('已发货', '待买家确认收货', '等待买家确认收货')):
+                        return 'shipped'
+                    if any(keyword in clean_text for keyword in ('待发货', '等待卖家发货', '买家已付款', '付款完成')):
+                        return 'pending_ship'
+                    if any(keyword in clean_text for keyword in ('待付款', '等待买家付款', '拍下')):
+                        return 'pending_payment'
+                    if any(keyword in clean_text for keyword in ('关闭', '取消', '超时')):
+                        return 'cancelled'
+                    return None
+
+                if (order_status is None or str(order_status or '').strip() in ('', 'unknown')) and status_text is not None:
+                    inferred_status = _infer_order_status_from_text(status_text)
+                    if inferred_status:
+                        order_status = inferred_status
+                if (order_status is None or str(order_status or '').strip() in ('', 'unknown')) and review_status in ('pending_review', 'reviewed'):
+                    order_status = 'completed'
+                if (
+                    (order_status is None or str(order_status or '').strip() in ('', 'unknown'))
+                    and 'reviewed' in (seller_review_status, buyer_review_status)
+                ):
+                    order_status = 'completed'
+                if review_status is None and 'reviewed' in (seller_review_status, buyer_review_status):
+                    review_status = (
+                        'reviewed'
+                        if seller_review_status == 'reviewed' and buyer_review_status == 'reviewed'
+                        else 'pending_review'
+                    )
+
+                def _lookup_item_price(effective_cookie_id: str, candidate_item_id: str):
+                    candidate_item_id = str(candidate_item_id or '').strip()
+                    if not effective_cookie_id or not candidate_item_id:
+                        return None
+                    cursor.execute(
+                        "SELECT item_price FROM item_info WHERE cookie_id = ? AND item_id = ? LIMIT 1",
+                        (effective_cookie_id, candidate_item_id)
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        normalized = _normalize_price(row[0])
+                        return normalized or None
+                    return None
+
+                def _lookup_item_owner(candidate_item_id: str):
+                    candidate_item_id = str(candidate_item_id or '').strip()
+                    if not candidate_item_id:
+                        return None
+                    cursor.execute(
+                        "SELECT cookie_id FROM item_info WHERE item_id = ? LIMIT 1",
+                        (candidate_item_id,)
+                    )
+                    row = cursor.fetchone()
+                    return row[0] if row else None
+
+                def _lookup_buyer_profile(effective_cookie_id: str, candidate_buyer_id: str):
+                    candidate_buyer_id = str(candidate_buyer_id or '').strip()
+                    if not effective_cookie_id or not candidate_buyer_id:
+                        return {}
+                    cursor.execute('''
+                    SELECT buyer_nick, receiver_name, receiver_phone, receiver_address, receiver_city
+                    FROM orders
+                    WHERE cookie_id = ? AND buyer_id = ? AND order_id != ?
+                      AND (
+                        COALESCE(buyer_nick, '') != ''
+                        OR COALESCE(receiver_name, '') != ''
+                        OR COALESCE(receiver_phone, '') != ''
+                        OR COALESCE(receiver_address, '') != ''
+                        OR COALESCE(receiver_city, '') != ''
+                      )
+                    ORDER BY
+                      (CASE WHEN COALESCE(receiver_address, '') != '' THEN 1 ELSE 0 END) DESC,
+                      (CASE WHEN COALESCE(buyer_nick, '') != '' THEN 1 ELSE 0 END) DESC,
+                      updated_at DESC
+                    LIMIT 1
+                    ''', (effective_cookie_id, candidate_buyer_id, order_id))
+                    row = cursor.fetchone()
+                    if not row:
+                        return {}
+                    return {
+                        'buyer_nick': row[0] or '',
+                        'receiver_name': row[1] or '',
+                        'receiver_phone': row[2] or '',
+                        'receiver_address': row[3] or '',
+                        'receiver_city': row[4] or '',
+                    }
+
+                owner_cookie_id = _lookup_item_owner(item_id)
+                if owner_cookie_id and cookie_id and owner_cookie_id != cookie_id:
+                    logger.warning(
+                        f"订单 {order_id} 商品 {item_id} 属于账号 {owner_cookie_id}，"
+                        f"消息来源账号 {cookie_id}，自动归属到商品账号"
+                    )
+                    cookie_id = owner_cookie_id
 
                 if existing:
                     # 更新现有订单
                     update_fields = []
                     update_values = []
+                    current_item_id = str(existing[1] or '').strip()
+                    current_buyer_id = str(existing[2] or '').strip()
+                    existing_cookie_id = str(existing[3] or '').strip()
+                    current_order_status = str(existing[4] or '').strip()
+                    effective_cookie_id = cookie_id or existing_cookie_id
+
+                    enrich_item_id = item_id if not _is_blank(item_id) else current_item_id
+                    if _is_blank(amount):
+                        amount = _lookup_item_price(effective_cookie_id, enrich_item_id)
+
+                    enrich_buyer_id = buyer_id if not _is_blank(buyer_id) else current_buyer_id
+                    buyer_profile = _lookup_buyer_profile(effective_cookie_id, enrich_buyer_id)
+                    if _is_blank(buyer_nick):
+                        buyer_nick = buyer_profile.get('buyer_nick') or buyer_nick
+                    if _is_blank(receiver_name):
+                        receiver_name = buyer_profile.get('receiver_name') or receiver_name
+                    if _is_blank(receiver_phone):
+                        receiver_phone = buyer_profile.get('receiver_phone') or receiver_phone
+                    if _is_blank(receiver_address):
+                        receiver_address = buyer_profile.get('receiver_address') or receiver_address
+                    if _is_blank(receiver_city):
+                        receiver_city = buyer_profile.get('receiver_city') or receiver_city
+
+                    def _item_exists(candidate_item_id: str) -> bool:
+                        candidate_item_id = str(candidate_item_id or '').strip()
+                        if not candidate_item_id:
+                            return False
+                        if effective_cookie_id:
+                            cursor.execute(
+                                "SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ? LIMIT 1",
+                                (effective_cookie_id, candidate_item_id)
+                            )
+                        else:
+                            cursor.execute(
+                                "SELECT 1 FROM item_info WHERE item_id = ? LIMIT 1",
+                                (candidate_item_id,)
+                            )
+                        return cursor.fetchone() is not None
 
                     if item_id is not None:
-                        update_fields.append("item_id = ?")
-                        update_values.append(item_id)
+                        incoming_item_id = str(item_id or '').strip()
+                        should_preserve_item = (
+                            current_item_id
+                            and incoming_item_id
+                            and incoming_item_id != current_item_id
+                            and _item_exists(current_item_id)
+                            and not _item_exists(incoming_item_id)
+                        )
+                        if should_preserve_item:
+                            logger.warning(
+                                f"订单 {order_id} 跳过可疑商品ID覆盖: {current_item_id} -> {incoming_item_id}"
+                            )
+                        else:
+                            update_fields.append("item_id = ?")
+                            update_values.append(item_id)
                     if buyer_id is not None:
-                        update_fields.append("buyer_id = ?")
-                        update_values.append(buyer_id)
+                        incoming_buyer_id = str(buyer_id or '').strip()
+                        incoming_item_id = str(item_id or '').strip() if item_id is not None else ''
+                        should_preserve_buyer = (
+                            current_buyer_id
+                            and incoming_buyer_id
+                            and incoming_buyer_id != current_buyer_id
+                            and incoming_item_id
+                            and incoming_buyer_id == incoming_item_id
+                            and current_item_id
+                            and current_item_id != incoming_item_id
+                        )
+                        if should_preserve_buyer:
+                            logger.warning(
+                                f"订单 {order_id} 跳过可疑买家ID覆盖: {current_buyer_id} -> {incoming_buyer_id}"
+                            )
+                        else:
+                            update_fields.append("buyer_id = ?")
+                            update_values.append(buyer_id)
+                    if buyer_nick is not None:
+                        update_fields.append("buyer_nick = ?")
+                        update_values.append(buyer_nick)
                     if spec_name is not None:
                         update_fields.append("spec_name = ?")
                         update_values.append(spec_name)
@@ -4616,8 +4985,37 @@ class DBManager:
                         update_fields.append("amount = ?")
                         update_values.append(amount)
                     if order_status is not None:
-                        update_fields.append("order_status = ?")
-                        update_values.append(order_status)
+                        incoming_order_status = str(order_status or '').strip()
+                        should_preserve_status = (
+                            incoming_order_status == 'unknown'
+                            and current_order_status
+                            and current_order_status not in ('unknown', 'processing')
+                        )
+                        if should_preserve_status:
+                            logger.warning(
+                                f"订单 {order_id} 跳过 unknown 状态覆盖: {current_order_status} -> unknown"
+                            )
+                        else:
+                            update_fields.append("order_status = ?")
+                            update_values.append(order_status)
+                    if status_text is not None:
+                        update_fields.append("status_text = ?")
+                        update_values.append(status_text)
+                    if review_status is not None:
+                        update_fields.append("review_status = ?")
+                        update_values.append(review_status)
+                    if seller_review_status is not None:
+                        update_fields.append("seller_review_status = ?")
+                        update_values.append(seller_review_status)
+                    if buyer_review_status is not None:
+                        update_fields.append("buyer_review_status = ?")
+                        update_values.append(buyer_review_status)
+                    if refund_reason is not None:
+                        update_fields.append("refund_reason = ?")
+                        update_values.append(refund_reason)
+                    if refund_description is not None:
+                        update_fields.append("refund_description = ?")
+                        update_values.append(refund_description)
                     if cookie_id is not None:
                         update_fields.append("cookie_id = ?")
                         update_values.append(cookie_id)
@@ -4637,6 +5035,9 @@ class DBManager:
                     if receiver_address is not None:
                         update_fields.append("receiver_address = ?")
                         update_values.append(receiver_address)
+                    if receiver_city is not None:
+                        update_fields.append("receiver_city = ?")
+                        update_values.append(receiver_city)
                     if system_shipped is not None:
                         update_fields.append("system_shipped = ?")
                         update_values.append(1 if system_shipped else 0)
@@ -4670,29 +5071,54 @@ class DBManager:
                         logger.info(f"更新订单信息: {order_id}")
                 else:
                     # 插入新订单
+                    if _is_blank(amount):
+                        amount = _lookup_item_price(cookie_id, item_id)
+
+                    buyer_profile = _lookup_buyer_profile(cookie_id, buyer_id)
+                    if _is_blank(buyer_nick):
+                        buyer_nick = buyer_profile.get('buyer_nick') or buyer_nick
+                    if _is_blank(receiver_name):
+                        receiver_name = buyer_profile.get('receiver_name') or receiver_name
+                    if _is_blank(receiver_phone):
+                        receiver_phone = buyer_profile.get('receiver_phone') or receiver_phone
+                    if _is_blank(receiver_address):
+                        receiver_address = buyer_profile.get('receiver_address') or receiver_address
+                    if _is_blank(receiver_city):
+                        receiver_city = buyer_profile.get('receiver_city') or receiver_city
+
                     if created_at:
                         # 使用提供的创建时间
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
                                           quantity, amount, order_status, cookie_id, is_bargain, created_at,
-                                          receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          buyer_nick, status_text, review_status, seller_review_status, buyer_review_status,
+                                          refund_reason, refund_description, receiver_name, receiver_phone,
+                                          receiver_address, receiver_city, system_shipped, chat_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0, created_at,
-                              receiver_name, receiver_phone, receiver_address,
+                              buyer_nick or '', status_text or '', review_status or '',
+                              seller_review_status or '', buyer_review_status or '',
+                              refund_reason or '', refund_description or '',
+                              receiver_name, receiver_phone, receiver_address, receiver_city,
                               1 if system_shipped else 0, chat_id or ''))
                     else:
                         # 使用默认的创建时间（CURRENT_TIMESTAMP，UTC时间）
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
                                           quantity, amount, order_status, cookie_id, is_bargain,
-                                          receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          buyer_nick, status_text, review_status, seller_review_status, buyer_review_status,
+                                          refund_reason, refund_description, receiver_name, receiver_phone,
+                                          receiver_address, receiver_city, system_shipped, chat_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0,
-                              receiver_name, receiver_phone, receiver_address,
+                              buyer_nick or '', status_text or '', review_status or '',
+                              seller_review_status or '', buyer_review_status or '',
+                              refund_reason or '', refund_description or '',
+                              receiver_name, receiver_phone, receiver_address, receiver_city,
                               1 if system_shipped else 0, chat_id or ''))
                     logger.info(f"插入新订单: {order_id}")
 
@@ -4712,7 +5138,10 @@ class DBManager:
                 # 先尝试查询包含version的订单
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at,
+                       version, chat_id, receiver_name, receiver_phone, receiver_address, receiver_city,
+                       buyer_nick, status_text, review_status, seller_review_status, buyer_review_status,
+                       refund_reason, refund_description
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -4734,7 +5163,18 @@ class DBManager:
                         'created_at': row[10],
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else ''
+                        'chat_id': row[13] if len(row) > 13 else '',
+                        'receiver_name': row[14] if len(row) > 14 else '',
+                        'receiver_phone': row[15] if len(row) > 15 else '',
+                        'receiver_address': row[16] if len(row) > 16 else '',
+                        'receiver_city': row[17] if len(row) > 17 else '',
+                        'buyer_nick': row[18] if len(row) > 18 else '',
+                        'status_text': row[19] if len(row) > 19 else '',
+                        'review_status': row[20] if len(row) > 20 else '',
+                        'seller_review_status': row[21] if len(row) > 21 else '',
+                        'buyer_review_status': row[22] if len(row) > 22 else '',
+                        'refund_reason': row[23] if len(row) > 23 else '',
+                        'refund_description': row[24] if len(row) > 24 else ''
                     }
                 return None
 
@@ -4811,7 +5251,9 @@ class DBManager:
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
                        quantity, amount, order_status, is_bargain, created_at, updated_at,
-                       receiver_name, receiver_phone, receiver_address
+                       receiver_name, receiver_phone, receiver_address, receiver_city,
+                       buyer_nick, status_text, review_status, seller_review_status, buyer_review_status,
+                       refund_reason, refund_description
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -4833,7 +5275,15 @@ class DBManager:
                         'updated_at': row[10],
                         'receiver_name': row[11],
                         'receiver_phone': row[12],
-                        'receiver_address': row[13]
+                        'receiver_address': row[13],
+                        'receiver_city': row[14],
+                        'buyer_nick': row[15],
+                        'status_text': row[16],
+                        'review_status': row[17] if len(row) > 17 else '',
+                        'seller_review_status': row[18] if len(row) > 18 else '',
+                        'buyer_review_status': row[19] if len(row) > 19 else '',
+                        'refund_reason': row[20] if len(row) > 20 else '',
+                        'refund_description': row[21] if len(row) > 21 else ''
                     })
 
                 return orders
@@ -4849,7 +5299,10 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at,
+                       receiver_name, receiver_phone, receiver_address, receiver_city,
+                       buyer_nick, status_text, review_status, seller_review_status, buyer_review_status,
+                       refund_reason, refund_description
                 FROM orders
                 ORDER BY created_at DESC LIMIT ?
                 ''', (limit,))
@@ -4869,7 +5322,18 @@ class DBManager:
                         'cookie_id': row[8],
                         'is_bargain': bool(row[9]) if row[9] is not None else False,
                         'created_at': row[10],
-                        'updated_at': row[11]
+                        'updated_at': row[11],
+                        'receiver_name': row[12],
+                        'receiver_phone': row[13],
+                        'receiver_address': row[14],
+                        'receiver_city': row[15],
+                        'buyer_nick': row[16],
+                        'status_text': row[17],
+                        'review_status': row[18] if len(row) > 18 else '',
+                        'seller_review_status': row[19] if len(row) > 19 else '',
+                        'buyer_review_status': row[20] if len(row) > 20 else '',
+                        'refund_reason': row[21] if len(row) > 21 else '',
+                        'refund_description': row[22] if len(row) > 22 else ''
                     })
 
                 return orders

@@ -2,7 +2,7 @@ import { get, post, put, del } from '../lib/request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
-  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply
+  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply, RefundDetail
 } from '../types';
 
 // Auth
@@ -148,6 +148,54 @@ export const syncOrders = async (cookieId?: string, status?: string): Promise<an
 
 export const syncSingleOrder = async (orderId: string): Promise<any> => {
   return post(`/api/orders/${orderId}/refresh`);
+};
+
+export const getRefundDetail = async (orderId: string): Promise<RefundDetail> => {
+  const result = await get<{ data: RefundDetail }>(`/api/orders/${orderId}/refund`);
+  return result.data;
+};
+
+export const handleRefundAction = async (
+  orderId: string,
+  action: 'approve' | 'reject',
+  reason?: string,
+  description?: string
+): Promise<{
+  success: boolean;
+  confirmed?: boolean;
+  requires_app?: boolean;
+  message: string;
+  detail_url?: string;
+  data?: Order;
+}> => {
+  return post(`/api/orders/${orderId}/refund/action`, { action, reason, description });
+};
+
+export const getReviews = async (
+  status?: string,
+  page: number = 1,
+  pageSize: number = 20
+): Promise<PaginatedResponse<Order>> => {
+  const params: any = { page, page_size: pageSize };
+  if (status && status !== 'all') params.status = status;
+
+  const res = await get<any>('/api/reviews', params);
+  const reviews = res.orders || res.data || [];
+  return {
+    success: true,
+    data: reviews,
+    total: res.total || reviews.length,
+    page: res.page || page,
+    page_size: res.page_size || pageSize,
+    total_pages: res.total_pages || 1
+  };
+};
+
+export const updateReviewStatus = async (
+  orderId: string,
+  reviewStatus: 'pending_review' | 'reviewed'
+): Promise<ApiResponse> => {
+  return put(`/api/reviews/${orderId}/status`, { review_status: reviewStatus });
 };
 
 export const manualShipOrder = async (orderIds: string[], shipMode: 'status_only' | 'full_delivery', content?: string): Promise<any> => {
