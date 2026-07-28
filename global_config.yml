@@ -2,6 +2,18 @@ API_ENDPOINTS:
   login_check: https://passport.goofish.com/newlogin/hasLogin.do
   message_headinfo: https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/
   token: https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/
+DATABASE:
+  type: mysql
+  host: 192.168.1.31
+  port: 3306
+  database: xianyu_super_butler
+  username: root
+  password: 'eq2*r34rwr4!'
+  charset: utf8mb4
+  timezone: '+08:00'
+  connect_timeout: 10
+  read_timeout: 30
+  write_timeout: 30
 APP_CONFIG:
   api_version: '1.0'
   app_key: 444e9908a51d1cb236a27862abc769c9

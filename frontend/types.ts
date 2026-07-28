@@ -130,6 +130,15 @@ export interface ChatMessage {
   role: 'buyer' | 'seller' | 'system';
   content: string;
   message_type: string;
+  payload?: {
+    item_card?: {
+      item_id?: string;
+      title?: string;
+      image_url?: string;
+      price?: string;
+      tip?: string;
+    };
+  };
   source: string;
   created_at: string;
 }

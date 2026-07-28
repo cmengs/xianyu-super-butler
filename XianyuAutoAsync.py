@@ -1355,8 +1355,8 @@ class XianyuLive:
                             WHEN order_status IN ('shipped', 'pending_ship', 'refunding', 'unknown') THEN 0
                             ELSE 1
                         END,
-                        datetime(COALESCE(NULLIF(created_at, ''), updated_at)) DESC,
-                        datetime(updated_at) DESC
+                        COALESCE(created_at, updated_at) DESC,
+                        updated_at DESC
                     LIMIT 1
                 ''', params)
                 row = cursor.fetchone()
@@ -7671,6 +7671,45 @@ class XianyuLive:
         except Exception:
             return False
 
+    @staticmethod
+    def _extract_chat_message_payload(message_1):
+        """提取闲鱼聊天中的商品卡片，返回消息类型和可持久化数据。"""
+        try:
+            content_wrapper = message_1.get("6")
+            if not isinstance(content_wrapper, dict):
+                return "text", {}
+            content_detail = content_wrapper.get("3")
+            if not isinstance(content_detail, dict):
+                return "text", {}
+
+            raw_payload = content_detail.get("5")
+            if isinstance(raw_payload, str):
+                parsed_payload = json.loads(raw_payload)
+            elif isinstance(raw_payload, dict):
+                parsed_payload = raw_payload
+            else:
+                return "text", {}
+
+            item_card = parsed_payload.get("itemCard")
+            if not isinstance(item_card, dict):
+                return "text", {}
+            item = item_card.get("item")
+            if not isinstance(item, dict):
+                return "text", {}
+
+            card_payload = {
+                "item_id": str(item.get("itemId") or "").strip(),
+                "title": str(item.get("title") or "").strip(),
+                "image_url": str(item.get("mainPic") or "").strip(),
+                "price": str(item.get("price") or "").strip(),
+                "tip": str(item_card.get("itemTip") or "").strip(),
+            }
+            if not any(card_payload.values()):
+                return "text", {}
+            return "item_card", {"item_card": card_payload}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "text", {}
+
     def is_sync_package(self, message_data):
         """判断是否为同步包消息"""
         try:
@@ -8479,9 +8518,23 @@ class XianyuLive:
 
                 create_time = int(message_1.get("5", 0))
                 message_10 = message_1["10"]
-                send_user_name = str(
-                    message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
-                    or "未知用户"
+                content_type = 0
+                content_wrapper = message_1.get("6")
+                if isinstance(content_wrapper, dict):
+                    content_detail = content_wrapper.get("3")
+                    if isinstance(content_detail, dict):
+                        try:
+                            content_type = int(content_detail.get("4") or 0)
+                        except (TypeError, ValueError):
+                            content_type = 0
+
+                sender_nick = str(message_10.get("senderNick") or '').strip()
+                reminder_title = str(message_10.get("reminderTitle") or '').strip()
+                is_platform_notice = content_type in {14, 25, 26, 28}
+                send_user_name = (
+                    sender_nick
+                    if sender_nick
+                    else ('' if is_platform_notice else reminder_title or "未知用户")
                 )
                 send_user_id = str(message_10.get("senderUserId", "unknown") or "unknown").strip()
                 send_message = str(message_10.get("reminderContent", "") or "")
@@ -8489,9 +8542,18 @@ class XianyuLive:
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
                 external_message_id = str(message_1.get("3") or "").strip() or None
+                message_type, message_payload = self._extract_chat_message_payload(message_1)
+                session_type = str(message_10.get("sessionType") or "1").strip()
 
             except Exception as e:
                 logger.error(f"提取聊天消息信息失败: {self._safe_str(e)}")
+                return
+
+            if session_type != "1":
+                logger.info(
+                    f"【{self.cookie_id}】忽略非私聊会话消息: "
+                    f"session_type={session_type}, chat_id={chat_id}"
+                )
                 return
 
             # 格式化消息时间
@@ -8518,6 +8580,8 @@ class XianyuLive:
                         item_id=item_id or conversation.get('item_id') or '',
                         role='seller',
                         content=send_message,
+                        message_type=message_type,
+                        message_payload=message_payload,
                         external_message_id=external_message_id,
                         source='xianyu_echo',
                         created_at=msg_time,
@@ -8541,6 +8605,8 @@ class XianyuLive:
                         item_id=item_id or '',
                         role='buyer',
                         content=send_message,
+                        message_type=message_type,
+                        message_payload=message_payload,
                         external_message_id=external_message_id,
                         source='xianyu',
                         created_at=msg_time,

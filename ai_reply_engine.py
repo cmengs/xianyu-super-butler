@@ -476,8 +476,8 @@ class AIReplyEngine:
                 # 获取刚插入记录的created_at
                 cursor.execute('''
                 SELECT created_at FROM ai_conversations 
-                WHERE rowid = last_insert_rowid()
-                ''')
+                WHERE id = ?
+                ''', (cursor.lastrowid,))
                 result = cursor.fetchone()
                 return result[0] if result else None
         except Exception as e:

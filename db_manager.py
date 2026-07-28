@@ -12,41 +12,108 @@ import base64
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
+from config import config as app_config
+from mysql_compat import connect_mysql
+try:
+    from pymysql.err import IntegrityError as MySQLIntegrityError
+except ImportError:
+    class MySQLIntegrityError(Exception):
+        pass
+
+
+_PLATFORM_CHAT_NAMES = {
+    '未知用户',
+    '工作台通知',
+    '等待你发货',
+    '我已付款，等待你发货',
+    '未付款，买家关闭订单',
+}
+_PLATFORM_CHAT_NAME_FRAGMENTS = (
+    '送Ta闲鱼小红花',
+    '交易履约',
+    '退款申请',
+)
+
+
+def _is_platform_chat_name(value: Any) -> bool:
+    name = str(value or '').strip().strip('[]')
+    return (
+        not name
+        or name in _PLATFORM_CHAT_NAMES
+        or any(fragment in name for fragment in _PLATFORM_CHAT_NAME_FRAGMENTS)
+    )
+
 
 class DBManager:
-    """SQLite数据库管理，持久化存储Cookie和关键字"""
+    """数据库管理器，支持 SQLite 与 MySQL。"""
     
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
+        database_config = dict(app_config.get('DATABASE', {}) or {})
+        self.db_type = os.getenv(
+            'DB_TYPE',
+            str(database_config.get('type', 'sqlite')),
+        ).strip().lower()
+        if self.db_type not in {'sqlite', 'mysql'}:
+            raise ValueError(f"不支持的数据库类型: {self.db_type}")
+
+        if self.db_type == 'mysql':
+            database_config['host'] = os.getenv(
+                'DB_HOST',
+                str(database_config.get('host', '127.0.0.1')),
+            )
+            database_config['port'] = int(os.getenv(
+                'DB_PORT',
+                str(database_config.get('port', 3306)),
+            ))
+            database_config['username'] = os.getenv(
+                'DB_USERNAME',
+                str(database_config.get('username', 'root')),
+            )
+            env_password = os.getenv('DB_PASSWORD')
+            if env_password is not None:
+                database_config['password'] = env_password
+            database_config['database'] = os.getenv(
+                'DB_NAME',
+                str(database_config.get('database', 'xianyu_super_butler')),
+            )
+            self.database_config = database_config
+            self.db_path = None
+        else:
+            self.database_config = {}
+
         # 支持环境变量配置数据库路径
         if db_path is None:
             db_path = os.getenv('DB_PATH', 'data/xianyu_data.db')
 
-        # 确保数据目录存在并有正确权限
-        db_dir = os.path.dirname(db_path)
-        if db_dir and not os.path.exists(db_dir):
-            try:
-                os.makedirs(db_dir, mode=0o755, exist_ok=True)
-                logger.info(f"创建数据目录: {db_dir}")
-            except PermissionError as e:
-                logger.error(f"创建数据目录失败，权限不足: {e}")
-                # 尝试使用当前目录
-                db_path = os.path.basename(db_path)
-                logger.warning(f"使用当前目录作为数据库路径: {db_path}")
-            except Exception as e:
-                logger.error(f"创建数据目录失败: {e}")
-                raise
+        if self.db_type == 'sqlite':
+            # 确保数据目录存在并有正确权限
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                try:
+                    os.makedirs(db_dir, mode=0o755, exist_ok=True)
+                    logger.info(f"创建数据目录: {db_dir}")
+                except PermissionError as e:
+                    logger.error(f"创建数据目录失败，权限不足: {e}")
+                    db_path = os.path.basename(db_path)
+                    logger.warning(f"使用当前目录作为数据库路径: {db_path}")
+                except Exception as e:
+                    logger.error(f"创建数据目录失败: {e}")
+                    raise
 
-        # 检查目录权限
-        if db_dir and os.path.exists(db_dir):
-            if not os.access(db_dir, os.W_OK):
+            if db_dir and os.path.exists(db_dir) and not os.access(db_dir, os.W_OK):
                 logger.error(f"数据目录没有写权限: {db_dir}")
-                # 尝试使用当前目录
                 db_path = os.path.basename(db_path)
                 logger.warning(f"使用当前目录作为数据库路径: {db_path}")
 
-        self.db_path = db_path
-        logger.info(f"数据库路径: {self.db_path}")
+            self.db_path = db_path
+            logger.info(f"SQLite 数据库路径: {self.db_path}")
+        else:
+            logger.info(
+                f"MySQL 数据库: {self.database_config['host']}:"
+                f"{self.database_config['port']}/"
+                f"{self.database_config['database']}"
+            )
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
 
@@ -66,6 +133,10 @@ class DBManager:
     
     def init_db(self):
         """初始化数据库表结构"""
+        if self.db_type == 'mysql':
+            self._init_mysql_db()
+            return
+
         try:
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = self.conn.cursor()
@@ -127,6 +198,7 @@ class DBManager:
             # 创建keywords表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cookie_id TEXT,
                 keyword TEXT,
                 reply TEXT,
@@ -209,6 +281,7 @@ class DBManager:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 message_type TEXT DEFAULT 'text',
+                message_payload TEXT DEFAULT '',
                 external_message_id TEXT,
                 source TEXT DEFAULT 'xianyu',
                 is_read INTEGER DEFAULT 0,
@@ -225,6 +298,15 @@ class DBManager:
             CREATE INDEX IF NOT EXISTS idx_chat_messages_unread
             ON chat_messages(cookie_id, chat_id, is_read)
             ''')
+            try:
+                self._execute_sql(cursor, "SELECT message_payload FROM chat_messages LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 chat_messages 表添加 message_payload 列...")
+                self._execute_sql(
+                    cursor,
+                    "ALTER TABLE chat_messages ADD COLUMN message_payload TEXT DEFAULT ''"
+                )
+                logger.info("chat_messages 表 message_payload 列添加完成")
 
             # 首次启用聊天时，用已有 AI 对话填充可用的历史记录。
             cursor.execute("SELECT COUNT(*) FROM chat_messages")
@@ -593,7 +675,7 @@ class DBManager:
             # 创建系统设置表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
+                `key` TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 description TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -620,13 +702,13 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS user_settings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                key TEXT NOT NULL,
+                `key` TEXT NOT NULL,
                 value TEXT NOT NULL,
                 description TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                UNIQUE(user_id, key)
+                UNIQUE(user_id, `key`)
             )
             ''')
 
@@ -648,7 +730,7 @@ class DBManager:
 
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
             cursor.execute('''
-            INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
+            INSERT OR IGNORE INTO system_settings (`key`, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
             ('registration_enabled', 'true', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
@@ -678,6 +760,125 @@ class DBManager:
             logger.error(f"数据库初始化失败: {e}")
             self.conn.rollback()
             raise
+
+    def _init_mysql_db(self):
+        """连接 MySQL，并确认迁移后的核心表已经存在。"""
+        self.conn = connect_mysql(self.database_config)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = ?
+            """,
+            (self.database_config['database'],),
+        )
+        tables = {row[0] for row in cursor.fetchall()}
+        required_tables = {'users', 'cookies', 'system_settings', 'orders'}
+        missing_tables = sorted(required_tables - tables)
+        if missing_tables:
+            self.conn.close()
+            self.conn = None
+            raise RuntimeError(
+                "MySQL 缺少核心表: "
+                + ", ".join(missing_tables)
+                + "。请先执行 data/xianyu_mysql.sql"
+            )
+        repaired = self.repair_chat_conversation_names()
+        logger.info(f"MySQL 连接成功，检测到 {len(tables)} 张表")
+        if repaired:
+            logger.info(f"已修复 {repaired} 个被平台通知污染的聊天昵称")
+
+    def repair_chat_conversation_names(self) -> int:
+        """清理平台通知标题，并从历史消息或订单中恢复真实昵称。"""
+        if not self.conn:
+            return 0
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, user_name FROM chat_messages")
+        polluted_message_ids = [
+            row[0]
+            for row in cursor.fetchall()
+            if row[1] and _is_platform_chat_name(row[1])
+        ]
+        if polluted_message_ids:
+            cursor.executemany(
+                "UPDATE chat_messages SET user_name = '' WHERE id = ?",
+                [(message_id,) for message_id in polluted_message_ids],
+            )
+
+        cursor.execute(
+            """
+            SELECT cookie_id, chat_id, user_id, user_name
+            FROM chat_conversations
+            """
+        )
+        repaired = 0
+        for cookie_id, chat_id, user_id, current_name in cursor.fetchall():
+            if not _is_platform_chat_name(current_name):
+                continue
+            original_name = str(current_name or '').strip().strip('[]')
+
+            cursor.execute(
+                """
+                SELECT user_name
+                FROM chat_messages
+                WHERE cookie_id = ? AND chat_id = ?
+                  AND user_name IS NOT NULL AND user_name != ''
+                ORDER BY id DESC
+                """,
+                (cookie_id, chat_id),
+            )
+            resolved_name = next(
+                (
+                    row[0]
+                    for row in cursor.fetchall()
+                    if not _is_platform_chat_name(row[0])
+                ),
+                '',
+            )
+
+            if not resolved_name:
+                cursor.execute(
+                    """
+                    SELECT buyer_nick
+                    FROM orders
+                    WHERE cookie_id = ? AND buyer_id = ?
+                      AND buyer_nick IS NOT NULL AND buyer_nick != ''
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (cookie_id, user_id),
+                )
+                order_row = cursor.fetchone()
+                if order_row and not _is_platform_chat_name(order_row[0]):
+                    resolved_name = order_row[0]
+
+            if original_name == '工作台通知' and not resolved_name:
+                cursor.execute(
+                    "DELETE FROM chat_messages WHERE cookie_id = ? AND chat_id = ?",
+                    (cookie_id, chat_id),
+                )
+                cursor.execute(
+                    "DELETE FROM chat_conversations WHERE cookie_id = ? AND chat_id = ?",
+                    (cookie_id, chat_id),
+                )
+                repaired += 1
+                continue
+
+            resolved_name = str(resolved_name or user_id or '').strip()
+            cursor.execute(
+                """
+                UPDATE chat_conversations
+                SET user_name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE cookie_id = ? AND chat_id = ?
+                """,
+                (resolved_name, cookie_id, chat_id),
+            )
+            repaired += 1
+
+        self.conn.commit()
+        return repaired
 
     def _migrate_database(self, cursor):
         """执行数据库迁移"""
@@ -710,18 +911,20 @@ class DBManager:
                 logger.info("数据库迁移完成：添加pause_duration列")
 
             # 确保商品同步配置存在
-            cursor.execute("SELECT key FROM system_settings WHERE key IN ('item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages')")
+            cursor.execute("SELECT `key` FROM system_settings WHERE `key` IN ('item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages')")
             existing_keys = [row[0] for row in cursor.fetchall()]
 
             if 'item_sync_enabled' not in existing_keys:
                 logger.info("添加商品同步配置：item_sync_enabled...")
-                cursor.execute("INSERT INTO system_settings (key, value, description) VALUES ('item_sync_enabled', 'true', '是否启用定时自动同步商品')")
+                cursor.execute("INSERT INTO system_settings (`key`, value, description) VALUES ('item_sync_enabled', 'true', '是否启用定时自动同步商品')")
             if 'item_sync_interval' not in existing_keys:
                 logger.info("添加商品同步配置：item_sync_interval...")
-                cursor.execute("INSERT INTO system_settings (key, value, description) VALUES ('item_sync_interval', '600', '商品同步间隔时间（秒）')")
+                cursor.execute("INSERT INTO system_settings (`key`, value, description) VALUES ('item_sync_interval', '600', '商品同步间隔时间（秒）')")
             if 'item_sync_max_pages' not in existing_keys:
                 logger.info("添加商品同步配置：item_sync_max_pages...")
-                cursor.execute("INSERT INTO system_settings (key, value, description) VALUES ('item_sync_max_pages', '5', '每次最多同步的页数')")
+                cursor.execute("INSERT INTO system_settings (`key`, value, description) VALUES ('item_sync_max_pages', '5', '每次最多同步的页数')")
+
+            self._ensure_keywords_primary_key(cursor)
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
@@ -1430,6 +1633,59 @@ class DBManager:
                 pass
             raise
 
+    def _ensure_keywords_primary_key(self, cursor):
+        """为旧版 keywords 表补充稳定主键，避免依赖 SQLite 隐式 rowid。"""
+        cursor.execute("PRAGMA table_info(keywords)")
+        columns = cursor.fetchall()
+        if any(column[1] == 'id' and int(column[5] or 0) > 0 for column in columns):
+            return
+
+        existing_columns = {column[1] for column in columns}
+        item_id_expr = "item_id" if "item_id" in existing_columns else "NULL"
+        type_expr = "COALESCE(type, 'text')" if "type" in existing_columns else "'text'"
+        image_url_expr = "image_url" if "image_url" in existing_columns else "NULL"
+
+        logger.info("正在为 keywords 表补充自增主键...")
+        cursor.execute("DROP TABLE IF EXISTS keywords_with_primary_key")
+        cursor.execute('''
+            CREATE TABLE keywords_with_primary_key (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT,
+                keyword TEXT,
+                reply TEXT,
+                item_id TEXT,
+                type TEXT DEFAULT 'text',
+                image_url TEXT,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+        ''')
+        cursor.execute(f'''
+            INSERT INTO keywords_with_primary_key (
+                cookie_id, keyword, reply, item_id, type, image_url
+            )
+            SELECT
+                cookie_id,
+                keyword,
+                reply,
+                {item_id_expr},
+                {type_expr},
+                {image_url_expr}
+            FROM keywords
+        ''')
+        cursor.execute("DROP TABLE keywords")
+        cursor.execute("ALTER TABLE keywords_with_primary_key RENAME TO keywords")
+        cursor.execute('''
+            CREATE UNIQUE INDEX idx_keywords_unique_no_item
+            ON keywords(cookie_id, keyword)
+            WHERE item_id IS NULL OR item_id = ''
+        ''')
+        cursor.execute('''
+            CREATE UNIQUE INDEX idx_keywords_unique_with_item
+            ON keywords(cookie_id, keyword, item_id)
+            WHERE item_id IS NOT NULL AND item_id != ''
+        ''')
+        logger.info("keywords 表自增主键迁移完成")
+
     def close(self):
         """关闭数据库连接"""
         if self.conn:
@@ -1439,7 +1695,10 @@ class DBManager:
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            if self.db_type == 'mysql':
+                self.conn = connect_mysql(self.database_config)
+            else:
+                self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         return self.conn
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
@@ -1816,7 +2075,7 @@ class DBManager:
                         self._execute_sql(cursor,
                             "INSERT INTO keywords (cookie_id, keyword, reply, item_id) VALUES (?, ?, ?, ?)",
                             (cookie_id, keyword, reply, normalized_item_id))
-                    except sqlite3.IntegrityError as ie:
+                    except (sqlite3.IntegrityError, MySQLIntegrityError) as ie:
                         # 如果遇到唯一约束冲突，记录详细错误信息
                         item_desc = f"商品ID: {normalized_item_id}" if normalized_item_id else "通用关键词"
                         logger.error(f"关键词唯一约束冲突: Cookie={cookie_id}, 关键词='{keyword}', {item_desc}")
@@ -2009,13 +2268,13 @@ class DBManager:
 
                 # 先获取所有关键词
                 self._execute_sql(cursor,
-                    "SELECT rowid FROM keywords WHERE cookie_id = ? ORDER BY rowid",
+                    "SELECT id FROM keywords WHERE cookie_id = ? ORDER BY id",
                     (cookie_id,))
                 rows = cursor.fetchall()
 
                 if 0 <= index < len(rows):
-                    rowid = rows[index][0]
-                    self._execute_sql(cursor, "DELETE FROM keywords WHERE rowid = ?", (rowid,))
+                    keyword_id = rows[index][0]
+                    self._execute_sql(cursor, "DELETE FROM keywords WHERE id = ?", (keyword_id,))
                     self.conn.commit()
                     logger.info(f"删除关键词成功: {cookie_id}, 索引: {index}")
                     return True
@@ -2344,6 +2603,7 @@ class DBManager:
         user_name: str = '',
         item_id: str = '',
         message_type: str = 'text',
+        message_payload: Optional[Dict[str, Any]] = None,
         external_message_id: str = None,
         source: str = 'xianyu',
         created_at: str = None,
@@ -2354,6 +2614,17 @@ class DBManager:
         user_id = str(user_id or '').strip()
         role = str(role or '').strip()
         content = str(content or '').strip()
+        user_name = str(user_name or '').strip()
+        if _is_platform_chat_name(user_name):
+            user_name = ''
+        if isinstance(created_at, str):
+            created_at = created_at.strip() or None
+        payload_json = ''
+        if message_payload:
+            try:
+                payload_json = json.dumps(message_payload, ensure_ascii=False)
+            except (TypeError, ValueError):
+                payload_json = ''
         external_message_id = str(external_message_id or '').strip() or None
         if not cookie_id or not chat_id or not user_id or role not in ('buyer', 'seller', 'system') or not content:
             return None
@@ -2390,7 +2661,7 @@ class DBManager:
                         cookie_id,
                         chat_id,
                         user_id,
-                        str(user_name or '').strip(),
+                        user_name,
                         str(item_id or '').strip(),
                         content,
                         role,
@@ -2420,9 +2691,24 @@ class DBManager:
                     if pending:
                         cursor.execute('''
                             UPDATE chat_messages
-                            SET external_message_id = ?, source = ?, created_at = COALESCE(?, created_at)
+                            SET external_message_id = ?,
+                                source = ?,
+                                message_type = ?,
+                                message_payload = CASE
+                                    WHEN ? != '' THEN ?
+                                    ELSE message_payload
+                                END,
+                                created_at = COALESCE(?, created_at)
                             WHERE id = ?
-                        ''', (external_message_id, source, created_at, pending[0]))
+                        ''', (
+                            external_message_id,
+                            source,
+                            str(message_type or 'text').strip() or 'text',
+                            payload_json,
+                            payload_json,
+                            created_at,
+                            pending[0],
+                        ))
                         upsert_conversation()
                         self.conn.commit()
                         return pending[0]
@@ -2430,19 +2716,20 @@ class DBManager:
                 cursor.execute('''
                     INSERT INTO chat_messages (
                         cookie_id, chat_id, user_id, user_name, item_id, role,
-                        content, message_type, external_message_id, source,
+                        content, message_type, message_payload, external_message_id, source,
                         is_read, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
                 ''', (
                     cookie_id,
                     chat_id,
                     user_id,
-                    str(user_name or '').strip(),
+                    user_name,
                     str(item_id or '').strip(),
                     role,
                     content,
                     str(message_type or 'text').strip() or 'text',
+                    payload_json,
                     external_message_id,
                     str(source or 'xianyu').strip() or 'xianyu',
                     0 if role == 'buyer' else 1,
@@ -2588,7 +2875,7 @@ class DBManager:
                 cursor.execute('''
                     SELECT
                         id, cookie_id, chat_id, user_id, user_name, item_id,
-                        role, content, message_type, source, created_at
+                        role, content, message_type, message_payload, source, created_at
                     FROM chat_messages
                     WHERE cookie_id = ? AND chat_id = ?
                     ORDER BY id DESC LIMIT ?
@@ -2611,14 +2898,25 @@ class DBManager:
                         'role': row[6],
                         'content': row[7],
                         'message_type': row[8] or 'text',
-                        'source': row[9] or 'xianyu',
-                        'created_at': row[10],
+                        'payload': self._parse_chat_message_payload(row[9]),
+                        'source': row[10] or 'xianyu',
+                        'created_at': row[11],
                     }
                     for row in rows
                 ]
             except Exception as e:
                 logger.error(f"获取聊天消息失败: {e}")
                 return []
+
+    @staticmethod
+    def _parse_chat_message_payload(value: str) -> Dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            payload = json.loads(value)
+            return payload if isinstance(payload, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
 
     def get_chat_conversation(self, cookie_id: str, chat_id: str) -> Optional[Dict[str, str]]:
         """读取发送消息所需的买家和商品信息。"""
@@ -3055,7 +3353,7 @@ class DBManager:
                         cursor.execute(f"DELETE FROM {table}")
 
                     # 清空系统设置（保留管理员密码）
-                    self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
+                    self._execute_sql(cursor, "DELETE FROM system_settings WHERE `key` != 'admin_password_hash'")
 
                 # 导入数据
                 data = backup_data['data']
@@ -3085,14 +3383,24 @@ class DBManager:
 
                     # 构建插入语句
                     placeholders = ','.join(['?' for _ in columns])
+                    quoted_columns = ','.join(
+                        f"`{str(column).replace('`', '``')}`"
+                        for column in columns
+                    )
 
                     if table_name == 'system_settings':
                         # 系统设置需要特殊处理，避免覆盖管理员密码
                         for row in rows:
                             if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                                cursor.execute(
+                                    f"INSERT INTO {table_name} ({quoted_columns}) VALUES ({placeholders})",
+                                    row,
+                                )
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        cursor.executemany(
+                            f"INSERT INTO {table_name} ({quoted_columns}) VALUES ({placeholders})",
+                            rows,
+                        )
 
                 # 提交事务
                 self.conn.commit()
@@ -3110,7 +3418,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT value FROM system_settings WHERE key = ?", (key,))
+                self._execute_sql(cursor, "SELECT value FROM system_settings WHERE `key` = ?", (key,))
                 result = cursor.fetchone()
                 return result[0] if result else None
             except Exception as e:
@@ -3123,7 +3431,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
+                INSERT OR REPLACE INTO system_settings (`key`, value, description, updated_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (key, value, description))
                 self.conn.commit()
@@ -3139,7 +3447,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT key, value FROM system_settings")
+                self._execute_sql(cursor, "SELECT `key`, value FROM system_settings")
 
                 settings = {}
                 for row in cursor.fetchall():
@@ -3169,7 +3477,7 @@ class DBManager:
                 self.conn.commit()
                 logger.info(f"创建用户成功: {username} ({email})")
                 return True
-            except sqlite3.IntegrityError as e:
+            except (sqlite3.IntegrityError, MySQLIntegrityError) as e:
                 logger.error(f"创建用户失败，用户名或邮箱已存在: {e}")
                 self.conn.rollback()
                 return False
@@ -4991,7 +5299,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT key, value, description, updated_at
+                SELECT `key`, value, description, updated_at
                 FROM user_settings
                 WHERE user_id = ?
                 ORDER BY key
@@ -5018,7 +5326,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT value, description, updated_at
                 FROM user_settings
-                WHERE user_id = ? AND key = ?
+                WHERE user_id = ? AND `key` = ?
                 ''', (user_id, key))
 
                 row = cursor.fetchone()
@@ -5040,7 +5348,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO user_settings (user_id, key, value, description, updated_at)
+                INSERT OR REPLACE INTO user_settings (user_id, `key`, value, description, updated_at)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (user_id, key, value, description))
 
@@ -5163,13 +5471,9 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 获取表结构
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns_info = cursor.fetchall()
-                columns = [col[1] for col in columns_info]  # 列名
-
                 # 获取表数据
                 cursor.execute(f"SELECT * FROM {table_name}")
+                columns = [description[0] for description in cursor.description]
                 rows = cursor.fetchall()
 
                 # 转换为字典列表
@@ -5201,6 +5505,8 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if isinstance(created_at, str):
+                    created_at = created_at.strip() or None
 
                 # 检查cookie_id是否在cookies表中存在（如果提供了cookie_id）
                 if cookie_id:
@@ -5840,7 +6146,13 @@ class DBManager:
                 cursor.execute(f"DELETE FROM {table_name}")
 
                 # 重置自增ID（如果有的话）
-                cursor.execute(f"DELETE FROM sqlite_sequence WHERE name = ?", (table_name,))
+                if self.db_type == 'mysql':
+                    cursor.execute(f"ALTER TABLE {table_name} AUTO_INCREMENT = 1")
+                else:
+                    cursor.execute(
+                        "DELETE FROM sqlite_sequence WHERE name = ?",
+                        (table_name,),
+                    )
 
                 self.conn.commit()
                 logger.info(f"清空表数据成功: {table_name}")

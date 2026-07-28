@@ -302,6 +302,7 @@ build/
 !CHANGELOG.md
 !CONTRIBUTING.md
 !LICENSE.md
+!MYSQL_MIGRATION.md
 !docs/*.md
 
 # 临时配置文件

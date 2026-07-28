@@ -3863,24 +3863,37 @@ def delete_keyword_by_index(cid: str, index: int, current_user: Dict[str, Any] =
 def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current_user)):
     """调试：检查keywords表结构"""
     try:
-        import sqlite3
-        conn = sqlite3.connect(db_manager.db_path)
-        cursor = conn.cursor()
-
-        # 获取表结构信息
-        cursor.execute("PRAGMA table_info(keywords)")
-        columns = cursor.fetchall()
+        cursor = db_manager.conn.cursor()
+        if db_manager.db_type == 'mysql':
+            cursor.execute(
+                """
+                SELECT column_name, column_type, column_default
+                FROM information_schema.columns
+                WHERE table_schema = ? AND table_name = 'keywords'
+                ORDER BY ordinal_position
+                """,
+                (db_manager.database_config['database'],),
+            )
+            table_columns = [
+                {"name": col[0], "type": col[1], "default": col[2]}
+                for col in cursor.fetchall()
+            ]
+        else:
+            cursor.execute("PRAGMA table_info(keywords)")
+            table_columns = [
+                {"name": col[1], "type": col[2], "default": col[4]}
+                for col in cursor.fetchall()
+            ]
 
         # 获取数据库版本
-        cursor.execute("SELECT value FROM system_settings WHERE key = 'db_version'")
+        cursor.execute("SELECT value FROM system_settings WHERE `key` = 'db_version'")
         version_result = cursor.fetchone()
         db_version = version_result[0] if version_result else "未知"
 
-        conn.close()
-
         return {
             "db_version": db_version,
-            "table_columns": [{"name": col[1], "type": col[2], "default": col[4]} for col in columns]
+            "database_type": db_manager.db_type,
+            "table_columns": table_columns,
         }
     except Exception as e:
         logger.error(f"检查表结构失败: {e}")
@@ -5564,6 +5577,11 @@ def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)
 
         # 使用db_manager的实际数据库路径
         from db_manager import db_manager
+        if db_manager.db_type != 'sqlite':
+            raise HTTPException(
+                status_code=400,
+                detail="MySQL 模式不支持下载 .db 文件，请使用 mysqldump 备份",
+            )
         db_file_path = db_manager.db_path
 
         # 检查数据库文件是否存在
@@ -5600,6 +5618,12 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
 
     try:
         log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
+        from db_manager import db_manager
+        if db_manager.db_type != 'sqlite':
+            raise HTTPException(
+                status_code=400,
+                detail="MySQL 模式不支持上传 .db 文件恢复，请使用 MySQL 导入工具",
+            )
 
         # 验证文件类型
         if not backup_file.filename.endswith('.db'):
