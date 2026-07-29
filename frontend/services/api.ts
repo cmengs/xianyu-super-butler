@@ -289,8 +289,27 @@ export const getShopOverview = async (): Promise<ShopOverview> => {
   return get('/analytics/shop-overview');
 };
 
-export const refreshShopOverview = async (cookieId?: string): Promise<ShopOverview> => {
-  return post('/analytics/shop-overview/refresh', cookieId ? { cookie_id: cookieId } : {});
+export const refreshShopOverview = async (
+  cookieId?: string,
+  productExposureDays: 1 | 7 | 30 = 30
+): Promise<ShopOverview> => {
+  return post('/analytics/shop-overview/refresh', {
+    ...(cookieId ? { cookie_id: cookieId } : {}),
+    product_exposure_days: productExposureDays,
+  });
+};
+
+export const polishShopItems = async (
+  cookieId: string
+): Promise<{
+  success: boolean;
+  message: string;
+  total: number;
+  polished: number;
+  already_polished: number;
+  failed: number;
+}> => {
+  return post(`/analytics/shop-overview/${encodeURIComponent(cookieId)}/polish`, {});
 };
 
 // Cards

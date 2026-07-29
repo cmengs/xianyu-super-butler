@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { AdminStats, OrderAnalytics, Order, OrderStatus, Item, ShopOverview } from '../types';
-import { getAdminStats, getOrderAnalytics, getValidOrders, getItems, getShopOverview, refreshShopOverview } from '../services/api';
-import { TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, ArrowUpRight, Calendar, X, BarChart3, PackageCheck, ExternalLink, Edit, RefreshCw, Store, BadgeCheck } from 'lucide-react';
+import { getAdminStats, getOrderAnalytics, getValidOrders, getItems, getShopOverview, refreshShopOverview, polishShopItems } from '../services/api';
+import { TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, ArrowUpRight, Calendar, X, BarChart3, PackageCheck, ExternalLink, Edit, RefreshCw, Store, BadgeCheck, Eye, Rocket } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, Legend } from 'recharts';
 
 // 状态徽章组件
@@ -53,6 +53,7 @@ const StatCard: React.FC<{ title: string; value: string | number; icon: React.El
 
 type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
 type ShopPeriod = '1' | '7' | '15' | '30';
+type ProductExposurePeriod = '1' | '7' | '30';
 type ShopDistributionKey = 'source' | 'item' | 'time' | 'region';
 
 const SHOP_PERIOD_OPTIONS: Array<{ key: ShopPeriod; label: string }> = [
@@ -67,6 +68,12 @@ const SHOP_DISTRIBUTION_OPTIONS: Array<{ key: ShopDistributionKey; label: string
   { key: 'time', label: '时间分布' },
   { key: 'region', label: '地域分布' },
   { key: 'item', label: '商品分布' },
+];
+
+const PRODUCT_EXPOSURE_PERIOD_OPTIONS: Array<{ key: ProductExposurePeriod; label: string }> = [
+  { key: '1', label: '近1天' },
+  { key: '7', label: '近7天' },
+  { key: '30', label: '近30天' },
 ];
 
 const Dashboard: React.FC = () => {
@@ -88,9 +95,12 @@ const Dashboard: React.FC = () => {
   const [shopOverview, setShopOverview] = useState<ShopOverview | null>(null);
   const [shopAccount, setShopAccount] = useState('');
   const [shopPeriod, setShopPeriod] = useState<ShopPeriod>('1');
+  const [productExposurePeriod, setProductExposurePeriod] = useState<ProductExposurePeriod>('30');
   const [shopDistribution, setShopDistribution] = useState<ShopDistributionKey>('source');
+  const [polishingItems, setPolishingItems] = useState(false);
   const [shopLoading, setShopLoading] = useState(false);
   const [shopError, setShopError] = useState('');
+  const productExposureRef = useRef<HTMLElement | null>(null);
 
   // 颜色配置
   const COLORS = ['#FFE815', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
@@ -308,7 +318,10 @@ const Dashboard: React.FC = () => {
     setShopLoading(true);
     setShopError('');
     try {
-      const data = await refreshShopOverview(shopAccount || undefined);
+      const data = await refreshShopOverview(
+        shopAccount || undefined,
+        Number(productExposurePeriod) as 1 | 7 | 30,
+      );
       setShopOverview(data);
       if (!shopAccount) {
         setShopAccount(
@@ -376,6 +389,32 @@ const Dashboard: React.FC = () => {
   const totalAmount = analytics.revenue_stats.total_amount || 0;
   const selectedShopProfile = shopOverview?.accounts.find(account => account.cookie_id === shopAccount);
   const selectedShopPeriod = selectedShopProfile?.shop_data?.periods?.[shopPeriod];
+  const selectedProductExposure = (
+    selectedShopProfile?.shop_data?.product_exposure_periods?.[productExposurePeriod]
+    || (
+      productExposurePeriod === '30'
+        ? selectedShopProfile?.shop_data?.product_exposure
+        : undefined
+    )
+  );
+  const productExposureSupportedDays = (
+    selectedShopProfile?.shop_data?.product_exposure_supported_days || [30]
+  );
+  const isProductExposurePeriodSupported = productExposureSupportedDays.includes(
+    Number(productExposurePeriod)
+  );
+  const productExposureStatusText = selectedProductExposure?.data_date
+    ? `数据更新至 ${selectedProductExposure.data_date}`
+    : !isProductExposurePeriodSupported
+      ? `近${productExposurePeriod}天为App专用数据`
+      : `近${productExposurePeriod}天数据尚未同步`;
+  const productExposureEmptyText = !isProductExposurePeriodSupported
+    ? `当前网页接口只返回近30天商品榜，近${productExposurePeriod}天需接入闲鱼App专用接口`
+    : selectedShopProfile?.shop_data?.product_exposure_requested_days === Number(productExposurePeriod)
+      ? selectedShopProfile?.shop_data?.product_exposure_message
+        || '当前接口未返回该周期数据'
+      : '点击右上角刷新按钮同步当前所选周期';
+  const productExposureItems = selectedProductExposure?.items || [];
   const availableDistributions = SHOP_DISTRIBUTION_OPTIONS.filter(
     option => Boolean(selectedShopPeriod?.distributions?.[option.key]?.items?.length)
   );
@@ -390,6 +429,24 @@ const Dashboard: React.FC = () => {
     ...(activeDistribution?.items || []).map(item => Number(item.value) || 0)
   );
   const latestShopUpdate = selectedShopProfile?.updated_at || '';
+
+  const handleManualExposure = async () => {
+    if (!shopAccount || polishingItems) return;
+    if (!window.confirm('确认一键擦亮当前账号的全部在售商品？')) return;
+
+    setPolishingItems(true);
+    try {
+      const result = await polishShopItems(shopAccount);
+      window.alert(
+        result.message
+        || `一键擦亮完成：本次成功 ${result.polished || 0}，今日已擦亮 ${result.already_polished || 0}，失败 ${result.failed || 0}`
+      );
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '一键擦亮失败');
+    } finally {
+      setPolishingItems(false);
+    }
+  };
 
   const formatShopMetricValue = (value: number, valueType?: string) => {
     if (valueType?.includes('PERCENTAGE')) {
@@ -464,7 +521,25 @@ const Dashboard: React.FC = () => {
           <h2 className="text-4xl font-extrabold text-gray-900 tracking-tight">运营概览</h2>
           <p className="text-gray-500 mt-2 text-base">欢迎回来，以下是闲鱼店铺的实时经营数据。</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleManualExposure}
+            disabled={!shopAccount || polishingItems}
+            className="h-10 px-4 rounded-lg bg-white border border-gray-200 text-gray-800 inline-flex items-center gap-2 text-sm font-bold shadow-sm hover:border-gray-300 hover:bg-gray-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="使用闲鱼擦亮接口处理当前账号的全部在售商品"
+          >
+            <Rocket className={`w-4 h-4 ${polishingItems ? 'animate-pulse' : ''}`} />
+            {polishingItems ? '擦亮中' : '一键擦亮'}
+          </button>
+          <button
+            type="button"
+            onClick={() => productExposureRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+            className="h-10 px-4 rounded-lg bg-[#FFE815] text-gray-900 inline-flex items-center gap-2 text-sm font-bold shadow-sm hover:bg-yellow-300 transition-colors"
+          >
+            <Eye className="w-4 h-4" />
+            商品曝光
+          </button>
           <div className="text-sm font-bold text-gray-700 bg-white px-5 py-2.5 rounded-full shadow-sm border border-gray-100 flex items-center gap-2">
             <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse"></span>
             系统正常运行
@@ -525,7 +600,7 @@ const Dashboard: React.FC = () => {
               onClick={handleShopRefresh}
               disabled={shopLoading || !shopAccount}
               className="w-10 h-10 rounded-lg border border-gray-200 inline-flex items-center justify-center text-gray-600 hover:text-black hover:border-yellow-400 disabled:opacity-50 transition-colors"
-              title="同步当前账号小铺数据"
+              title={`同步当前账号小铺数据及近${productExposurePeriod}天商品曝光`}
             >
               <RefreshCw className={`w-4 h-4 ${shopLoading ? 'animate-spin' : ''}`} />
             </button>
@@ -576,6 +651,98 @@ const Dashboard: React.FC = () => {
                 </div>
               ))}
             </div>
+
+            <section ref={productExposureRef} className="scroll-mt-5 border-b border-gray-100">
+              <div className="px-5 py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-base font-bold text-gray-900">商品曝光排行</h4>
+                  <p className="text-xs text-gray-400 mt-1">
+                    闲鱼小铺官方近{productExposurePeriod}天商品数据，按曝光次数倒序
+                  </p>
+                </div>
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                  <div className="inline-flex items-center bg-gray-100 p-1 rounded-lg">
+                    {PRODUCT_EXPOSURE_PERIOD_OPTIONS.map(option => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setProductExposurePeriod(option.key)}
+                        className={`h-8 px-3 rounded-md text-xs font-bold transition-colors ${
+                          productExposurePeriod === option.key
+                            ? 'bg-white text-gray-900 shadow-sm'
+                            : 'text-gray-500 hover:text-gray-800'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-xs text-gray-400 whitespace-nowrap">
+                    {productExposureStatusText}
+                  </span>
+                </div>
+              </div>
+
+              {productExposureItems.length ? (
+                <div className="overflow-x-auto">
+                  <div className="min-w-[720px]">
+                    <div className="grid grid-cols-[minmax(300px,1.6fr)_110px_90px_90px] gap-4 px-5 py-3 bg-gray-50 text-xs font-medium text-gray-400">
+                      <span>商品信息</span>
+                      <span className="text-right">曝光次数</span>
+                      <span className="text-right">浏览</span>
+                      <span className="text-right">想要</span>
+                    </div>
+                    {productExposureItems.map(item => (
+                      <div
+                        key={item.item_id}
+                        className="grid grid-cols-[minmax(300px,1.6fr)_110px_90px_90px] gap-4 items-center px-5 py-3 border-t border-gray-100"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          {item.main_pic ? (
+                            <img
+                              src={item.main_pic}
+                              alt=""
+                              className="w-12 h-12 rounded-md object-cover bg-gray-100 flex-none"
+                            />
+                          ) : (
+                            <div className="w-12 h-12 rounded-md bg-gray-100 flex items-center justify-center flex-none">
+                              <Package className="w-5 h-5 text-gray-300" />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <div className="text-sm font-bold text-gray-900 truncate" title={item.title}>
+                              {item.title || '未知商品'}
+                            </div>
+                            <div className="mt-1 text-xs text-gray-400 truncate">
+                              商品ID {item.item_id}
+                            </div>
+                          </div>
+                        </div>
+                        <span className="text-right text-lg font-extrabold text-gray-900 tabular-nums">
+                          {Number(item.exposure || 0).toLocaleString()}
+                        </span>
+                        <span className="text-right text-sm font-bold text-gray-700 tabular-nums">
+                          {Number(item.browse || 0).toLocaleString()}
+                        </span>
+                        <span className="text-right text-sm font-bold text-gray-700 tabular-nums">
+                          {Number(item.want || 0).toLocaleString()}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="h-32 px-5 flex flex-col items-center justify-center text-center border-t border-gray-100">
+                  <Eye className="w-7 h-7 text-gray-300 mb-2" />
+                  <p className="text-sm font-medium text-gray-500">
+                    当前账号暂无近{productExposurePeriod}天商品曝光排行
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {productExposureEmptyText}
+                  </p>
+                </div>
+              )}
+            </section>
 
             <div className="px-5 py-5 border-b border-gray-100">
               <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">

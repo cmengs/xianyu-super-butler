@@ -130,6 +130,7 @@ class DBManager:
         logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
 
         self.init_db()
+        self._ensure_account_ws_tokens_table()
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -849,6 +850,128 @@ class DBManager:
             """
         )
         self.conn.commit()
+
+    def _ensure_account_ws_tokens_table(self):
+        """创建消息服务 Token 缓存表；Token SQL 不进入普通参数日志。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            if self.db_type == 'mysql':
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_ws_tokens (
+                        cookie_id VARCHAR(191) NOT NULL,
+                        token LONGTEXT NOT NULL,
+                        device_id VARCHAR(191) DEFAULT '',
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (cookie_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                      COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_ws_tokens (
+                        cookie_id TEXT PRIMARY KEY,
+                        token TEXT NOT NULL,
+                        device_id TEXT DEFAULT '',
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            self.conn.commit()
+
+    def get_account_ws_session(self, cookie_id: str) -> Optional[Dict[str, str]]:
+        """读取账号已验证的消息 Token 及其绑定设备，不输出 Token 内容。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT token, device_id
+                    FROM account_ws_tokens
+                    WHERE cookie_id = ?
+                    """,
+                    (str(cookie_id),),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                token = str(row[0] or '')
+                if not token:
+                    return None
+                return {
+                    'token': token,
+                    'device_id': str(row[1] or ''),
+                }
+            except Exception as e:
+                logger.warning(f"读取账号 {cookie_id} 消息会话缓存失败: {e}")
+                return None
+
+    def get_account_ws_token(self, cookie_id: str, device_id: str = '') -> Optional[str]:
+        """读取账号已验证的消息 Token，不输出 Token 内容。"""
+        session = self.get_account_ws_session(cookie_id)
+        if not session:
+            return None
+        saved_device_id = session.get('device_id') or ''
+        if device_id and saved_device_id and saved_device_id != str(device_id):
+            logger.warning(f"账号 {cookie_id} 的消息 Token 设备标识不匹配，跳过缓存")
+            return None
+        return session.get('token') or None
+
+    def save_account_ws_token(self, cookie_id: str, token: str, device_id: str = '') -> bool:
+        """保存账号消息 Token，绕开带参数的 SQL 日志以免泄露凭证。"""
+        if not token:
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT cookie_id FROM account_ws_tokens WHERE cookie_id = ?",
+                    (str(cookie_id),),
+                )
+                if cursor.fetchone():
+                    cursor.execute(
+                        """
+                        UPDATE account_ws_tokens
+                        SET token = ?, device_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE cookie_id = ?
+                        """,
+                        (str(token), str(device_id or ''), str(cookie_id)),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO account_ws_tokens
+                            (cookie_id, token, device_id, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (str(cookie_id), str(token), str(device_id or '')),
+                    )
+                self.conn.commit()
+                logger.info(f"账号 {cookie_id} 的消息 Token 已安全缓存")
+                return True
+            except Exception as e:
+                self.conn.rollback()
+                logger.warning(f"缓存账号 {cookie_id} 消息 Token 失败: {e}")
+                return False
+
+    def delete_account_ws_token(self, cookie_id: str) -> bool:
+        """删除账号消息 Token 缓存。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "DELETE FROM account_ws_tokens WHERE cookie_id = ?",
+                    (str(cookie_id),),
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                self.conn.rollback()
+                logger.warning(f"删除账号 {cookie_id} 消息 Token 缓存失败: {e}")
+                return False
 
     def repair_chat_conversation_names(self) -> int:
         """清理平台通知标题，并从历史消息或订单中恢复真实昵称。"""
@@ -1857,6 +1980,10 @@ class DBManager:
                 cursor = self.conn.cursor()
                 # 删除关联的关键字
                 self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
+                cursor.execute(
+                    "DELETE FROM account_ws_tokens WHERE cookie_id = ?",
+                    (str(cookie_id),),
+                )
                 # 删除Cookie
                 self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (cookie_id,))
                 self.conn.commit()

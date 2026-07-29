@@ -5573,6 +5573,14 @@ async def refresh_shop_overview(
     metric_date = date.today().isoformat()
     user_cookies = db_manager.get_all_cookies(user_id)
     requested_cookie_id = str((request or {}).get('cookie_id') or '').strip()
+    try:
+        product_exposure_days = int(
+            (request or {}).get('product_exposure_days') or 30
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='商品曝光周期必须是数字')
+    if product_exposure_days not in (1, 7, 30):
+        raise HTTPException(status_code=400, detail='商品曝光周期仅支持1、7、30天')
     if requested_cookie_id:
         if requested_cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail='无权刷新该账号')
@@ -5600,7 +5608,10 @@ async def refresh_shop_overview(
                 for item in db_manager.get_items_by_cookie(cookie_id)
                 if item.get('item_id')
             ]
-            metrics = await instance.get_account_shop_overview(item_ids)
+            metrics = await instance.get_account_shop_overview(
+                item_ids,
+                product_exposure_days=product_exposure_days,
+            )
             incoming_shop_data = metrics.get('shop_data') or {}
             incoming_periods = incoming_shop_data.get('periods') or {}
             if not incoming_periods:
@@ -5614,6 +5625,25 @@ async def refresh_shop_overview(
                     **existing_periods,
                     **incoming_periods,
                 }
+            incoming_product_exposure = incoming_shop_data.get('product_exposure') or {}
+            existing_product_exposure = existing_shop_data.get('product_exposure') or {}
+            if (
+                existing_product_exposure
+                and not incoming_product_exposure
+            ):
+                incoming_shop_data['product_exposure'] = existing_product_exposure
+            incoming_exposure_periods = (
+                incoming_shop_data.get('product_exposure_periods') or {}
+            )
+            existing_exposure_periods = (
+                existing_shop_data.get('product_exposure_periods') or {}
+            )
+            if existing_exposure_periods:
+                incoming_shop_data['product_exposure_periods'] = {
+                    **existing_exposure_periods,
+                    **incoming_exposure_periods,
+                }
+            metrics['shop_data'] = incoming_shop_data
 
             # 资料接口偶发失败时 tracknick 是登录名，不允许覆盖已保存的闲鱼昵称。
             if (
@@ -5642,7 +5672,8 @@ async def refresh_shop_overview(
             log_with_user(
                 'info',
                 f"账号 {cookie_id} 鱼小铺数据刷新成功，"
-                f"本次获取 {len(incoming_periods)} 个周期",
+                f"本次获取 {len(incoming_periods)} 个周期，"
+                f"商品曝光请求周期 {product_exposure_days} 天",
                 current_user,
             )
         except Exception as exc:
@@ -5656,6 +5687,47 @@ async def refresh_shop_overview(
     response['success'] = not errors
     response['errors'] = errors
     return response
+
+
+@app.post('/analytics/shop-overview/{cookie_id}/polish')
+async def polish_shop_items(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """一键擦亮当前用户指定账号的全部在售商品。"""
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail='无权操作该账号')
+
+    from XianyuAutoAsync import XianyuLive
+
+    instance = XianyuLive(
+        user_cookies[cookie_id],
+        cookie_id,
+        user_id=current_user['user_id'],
+        register_instance=False,
+    )
+    try:
+        result = await instance.polish_all_items()
+    finally:
+        await instance.close_session()
+
+    if not result.get('success') and not result.get('polished'):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get('message') or '商品擦亮失败',
+        )
+    log_with_user(
+        'info',
+        (
+            f"账号 {cookie_id} 一键擦亮完成: "
+            f"本次成功 {result.get('polished', 0)}, "
+            f"今日已擦亮 {result.get('already_polished', 0)}, "
+            f"失败 {result.get('failed', 0)}"
+        ),
+        current_user,
+    )
+    return result
 
 # ------------------------- 指定商品回复接口 -------------------------
 

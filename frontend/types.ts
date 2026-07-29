@@ -284,6 +284,31 @@ export interface ShopDataPeriod {
   };
 }
 
+export interface ShopProductExposureItem {
+  item_id: string;
+  title: string;
+  main_pic?: string;
+  price?: string;
+  exposure: number;
+  browse: number;
+  want: number;
+  sales?: number;
+  deal_amount?: number;
+  item_status?: number;
+  item_type?: string;
+  created_at?: string;
+}
+
+export interface ShopProductExposure {
+  source: 'official_data_center' | string;
+  rank_type: 'EXPOSURE' | string;
+  period_days: number;
+  data_date: string;
+  server_time?: string;
+  has_next_page?: boolean;
+  items: ShopProductExposureItem[];
+}
+
 export interface ShopAccountMetrics {
   cookie_id: string;
   metric_date: string;
@@ -307,6 +332,11 @@ export interface ShopAccountMetrics {
     source: 'official_data_center' | string;
     supported_days: number[];
     periods: Record<string, ShopDataPeriod>;
+    product_exposure?: ShopProductExposure | null;
+    product_exposure_periods?: Record<string, ShopProductExposure>;
+    product_exposure_supported_days?: number[];
+    product_exposure_requested_days?: number;
+    product_exposure_message?: string;
   };
   updated_at?: string;
   status: 'ready' | 'not_synced' | 'error';

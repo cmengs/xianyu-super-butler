@@ -677,7 +677,12 @@ class XianyuLive:
 
         self.myid = self.cookies['unb']
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
-        self.device_id = generate_device_id(self.myid)
+        cached_ws_session = db_manager.get_account_ws_session(self.cookie_id)
+        cached_device_id = (
+            str(cached_ws_session.get('device_id') or '')
+            if cached_ws_session else ''
+        )
+        self.device_id = cached_device_id or generate_device_id(self.myid)
 
         # 心跳相关配置
         self.heartbeat_interval = HEARTBEAT_INTERVAL
@@ -692,6 +697,17 @@ class XianyuLive:
         self.token_retry_interval = TOKEN_RETRY_INTERVAL
         self.last_token_refresh_time = 0
         self.current_token = None
+        cached_ws_token = (
+            cached_ws_session.get('token')
+            if cached_ws_session else None
+        )
+        if cached_ws_token:
+            self.current_token = cached_ws_token
+            self.last_token_refresh_time = time.time()
+            logger.info(
+                f"【{self.cookie_id}】已载入上次验证成功的消息 Token，"
+                "并复用其绑定设备，本次启动优先使用现有登录状态"
+            )
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
 
@@ -2157,6 +2173,11 @@ class XianyuLive:
                                 new_token = res_json['data']['accessToken']
                                 self.current_token = new_token
                                 self.last_token_refresh_time = time.time()
+                                db_manager.save_account_ws_token(
+                                    self.cookie_id,
+                                    new_token,
+                                    self.device_id,
+                                )
 
                                 # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
                                 self.last_message_received_time = 0
@@ -4006,9 +4027,65 @@ class XianyuLive:
             'conversion': conversion,
         }
 
-    async def get_account_shop_overview(self, item_ids=None):
+    @classmethod
+    def _normalize_shop_item_query_response(cls, response):
+        """整理鱼小铺商品榜单，字段与官方小铺数据页保持一致。"""
+        payload = (response or {}).get('data') or {}
+        if not isinstance(payload, dict) or not payload:
+            return None
+
+        raw_items = payload.get('itemInfoVOList') or []
+        if not isinstance(raw_items, list):
+            return None
+
+        items = []
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item_id = str(raw_item.get('itemId') or raw_item.get('id') or '')
+            if not item_id:
+                continue
+            items.append({
+                'item_id': item_id,
+                'title': str(raw_item.get('title') or ''),
+                'main_pic': str(raw_item.get('mainPic') or ''),
+                'price': str(raw_item.get('price') or ''),
+                'exposure': cls._metric_int(raw_item.get('exposure')),
+                'browse': cls._metric_int(raw_item.get('browse')),
+                'want': cls._metric_int(raw_item.get('want')),
+                'sales': cls._metric_int(raw_item.get('sales')),
+                'deal_amount': raw_item.get('dealAmount', 0),
+                'item_status': cls._metric_int(raw_item.get('itemStatus')),
+                'item_type': str(raw_item.get('itemType') or ''),
+                'created_at': str(raw_item.get('itemCreateTime') or ''),
+            })
+
+        data_date = ''
+        try:
+            timestamp = int(str(payload.get('dataTimestamp') or '0')) / 1000
+            if timestamp > 0:
+                data_date = time.strftime('%Y-%m-%d', time.localtime(timestamp))
+        except (TypeError, ValueError, OverflowError):
+            data_date = ''
+
+        return {
+            'source': 'official_data_center',
+            'rank_type': 'EXPOSURE',
+            'period_days': 30,
+            'data_date': data_date,
+            'server_time': str(payload.get('serverTime') or ''),
+            'has_next_page': bool(payload.get('hasNextPage')),
+            'items': items,
+        }
+
+    async def get_account_shop_overview(
+        self,
+        item_ids=None,
+        product_exposure_days=30,
+    ):
         """获取账号资料以及鱼小铺官方数据中心指标。"""
         item_ids = [str(item_id) for item_id in (item_ids or []) if item_id]
+        product_exposure_days = int(product_exposure_days or 30)
         # 账号接口串行调用，避免两个请求同时刷新 H5 Token 时互相覆盖 Cookie。
         nav_response = await self._request_account_mtop(
             'mtop.idle.web.user.page.nav',
@@ -4043,10 +4120,43 @@ class XianyuLive:
             if normalized:
                 shop_periods[str(days)] = normalized
 
+        product_exposure = None
+        product_response = {'ret': [], 'data': {}}
+        product_exposure_message = ''
+        if product_exposure_days == 30:
+            product_response = await self._request_account_mtop(
+                'mtop.taobao.idle.pro.data.center.item.query',
+                {
+                    'rankType': 'EXPOSURE',
+                    'statusType': '',
+                    'stockType': '',
+                    'pageNo': 1,
+                    'pageSize': 10,
+                },
+                retry_count=1,
+            )
+            product_exposure = self._normalize_shop_item_query_response(
+                product_response
+            )
+        else:
+            product_exposure_message = (
+                f'闲鱼网页数据中心当前只提供近30天商品榜，'
+                f'近{product_exposure_days}天属于App专用数据，未返回可用接口'
+            )
+
         shop_data = {
             'source': 'official_data_center',
             'supported_days': [1, 7, 15, 30],
             'periods': shop_periods,
+            'product_exposure': product_exposure,
+            'product_exposure_supported_days': [30],
+            'product_exposure_requested_days': product_exposure_days,
+            'product_exposure_message': product_exposure_message,
+            'product_exposure_periods': (
+                {'30': product_exposure}
+                if product_exposure
+                else {}
+            ),
         }
         one_day_overview = {
             metric.get('type'): metric
@@ -4111,6 +4221,7 @@ class XianyuLive:
                 'head_ret': head_response.get('ret') or [],
                 'shop_data': shop_data,
                 'shop_period_returns': shop_period_returns,
+                'product_exposure_ret': product_response.get('ret') or [],
             },
         }
 
@@ -8203,6 +8314,21 @@ class XianyuLive:
         if self.session:
             await self.session.close()
             self.session = None
+
+    def _get_item_polish_module(self):
+        from item_polish_module import ItemPolishModule
+        return ItemPolishModule(self)
+
+    async def polish_item(self, item_id, retry_count=0):
+        """手动擦亮单个在售商品。"""
+        return await self._get_item_polish_module().polish_item(
+            item_id,
+            retry_count,
+        )
+
+    async def polish_all_items(self):
+        """手动擦亮当前账号的全部在售商品。"""
+        return await self._get_item_polish_module().polish_all_items()
 
     async def get_api_reply(self, msg_time, user_url, send_user_id, send_user_name, item_id, send_message, chat_id):
         """调用API获取回复消息"""
