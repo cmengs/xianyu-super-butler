@@ -3,7 +3,7 @@ import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
   Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply, RefundDetail,
-  ChatConversation, ChatMessage
+  ChatConversation, ChatMessage, ShopOverview
 } from '../types';
 
 // Auth
@@ -32,6 +32,9 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     value: item.value,
     cookie: item.value,
     enabled: item.enabled,
+    connected: item.connected,
+    connection_state: item.connection_state,
+    login_required: item.login_required,
     auto_confirm: item.auto_confirm,
     remark: item.remark,
     note: item.remark,
@@ -45,7 +48,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
   }));
 };
 
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string }> => {
+export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string }> => {
   return post('/qr-login/generate');
 };
 
@@ -281,6 +284,14 @@ export const getValidOrders = async (dateRange: {start_date: string; end_date: s
     });
     return res.orders || [];
 }
+
+export const getShopOverview = async (): Promise<ShopOverview> => {
+  return get('/analytics/shop-overview');
+};
+
+export const refreshShopOverview = async (cookieId?: string): Promise<ShopOverview> => {
+  return post('/analytics/shop-overview/refresh', cookieId ? { cookie_id: cookieId } : {});
+};
 
 // Cards
 export const getCards = async (): Promise<Card[]> => {

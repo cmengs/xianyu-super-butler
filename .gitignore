@@ -66,7 +66,7 @@ Thumbs.db
 # ==================== 项目特定文件 ====================
 # 日志文件
 logs/
-realtime.log
+logs/realtime.log
 
 # 数据目录
 data/
@@ -371,7 +371,7 @@ xianyu_data_backup_*.db
 user_stats.db
 
 # 实时日志文件
-realtime.log
+logs/realtime.log
 
 # PHP测试文件
 php/
@@ -484,7 +484,7 @@ trajectory_history/
 *.trajectory
 
 # 实时日志文件
-realtime.log
+logs/realtime.log
 *.realtime
 
 # Nuitka编译报告
@@ -557,7 +557,7 @@ backup_*.db
 *.log.*
 logs/
 *.realtime
-realtime.log
+logs/realtime.log
 
 # 配置文件备份
 *.yml.bak
@@ -675,7 +675,7 @@ backups/**
 logs/**
 *.log
 *.log.*
-realtime.log
+logs/realtime.log
 
 # Python编译文件完整覆盖
 *.pyc

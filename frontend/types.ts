@@ -31,6 +31,10 @@ export interface AccountDetail {
   value?: string; // cookie value from backend
   cookie?: string; // alias for value
   enabled: boolean;
+  connected?: boolean;
+  connection_state?: string;
+  connection_reason?: string;
+  login_required?: boolean;
   auto_confirm: boolean;
   remark?: string;
   note?: string; // alias for remark
@@ -240,6 +244,90 @@ export interface OrderAnalytics {
     total_amount: number;
     avg_amount: number;
   }>;
+}
+
+export interface ShopDataMetric {
+  type: string;
+  name: string;
+  value: number;
+  value_type: string;
+  change?: number | null;
+  change_type?: string;
+  tips?: string;
+  tab_type?: string;
+  trend?: Array<{ name: string; value: number }>;
+}
+
+export interface ShopDistribution {
+  label: string;
+  items: Array<{
+    name: string;
+    value: number;
+    value_type: string;
+  }>;
+}
+
+export interface ShopDataPeriod {
+  days: number;
+  data_date: string;
+  server_time: string;
+  overview: ShopDataMetric[];
+  distributions: Partial<Record<'source' | 'item' | 'time' | 'region', ShopDistribution>>;
+  repurchase: {
+    tips: string;
+    metrics: ShopDataMetric[];
+  };
+  conversion?: {
+    steps: ShopDataMetric[];
+    rates: ShopDataMetric[];
+    result?: ShopDataMetric | null;
+  };
+}
+
+export interface ShopAccountMetrics {
+  cookie_id: string;
+  metric_date: string;
+  nickname: string;
+  account_label?: string;
+  avatar?: string;
+  shop_name?: string;
+  is_shop: boolean;
+  followers: number;
+  following: number;
+  sold_count: number;
+  item_count: number;
+  first_browse_total: number;
+  browse_total: number;
+  today_browse: number;
+  collect_total: number;
+  want_total: number;
+  today_exposure?: number | null;
+  exposure_source?: string;
+  shop_data?: {
+    source: 'official_data_center' | string;
+    supported_days: number[];
+    periods: Record<string, ShopDataPeriod>;
+  };
+  updated_at?: string;
+  status: 'ready' | 'not_synced' | 'error';
+  error?: string;
+}
+
+export interface ShopOverview {
+  success?: boolean;
+  metric_date: string;
+  accounts: ShopAccountMetrics[];
+  totals: {
+    today_exposure?: number | null;
+    today_browse: number;
+    browse_total: number;
+    collect_total: number;
+    want_total: number;
+    followers: number;
+    sold_count: number;
+    item_count: number;
+  };
+  errors?: Array<{ cookie_id: string; message: string }>;
 }
 
 // Settings

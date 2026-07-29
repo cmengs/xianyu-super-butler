@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { AdminStats, OrderAnalytics, Order, OrderStatus, Item } from '../types';
-import { getAdminStats, getOrderAnalytics, getValidOrders, getItems } from '../services/api';
-import { TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, ArrowUpRight, Calendar, X, BarChart3, PackageCheck, ExternalLink, Eye, Edit } from 'lucide-react';
+import { AdminStats, OrderAnalytics, Order, OrderStatus, Item, ShopOverview } from '../types';
+import { getAdminStats, getOrderAnalytics, getValidOrders, getItems, getShopOverview, refreshShopOverview } from '../services/api';
+import { TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, ArrowUpRight, Calendar, X, BarChart3, PackageCheck, ExternalLink, Edit, RefreshCw, Store, BadgeCheck } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, Legend } from 'recharts';
 
 // 状态徽章组件
@@ -52,6 +52,22 @@ const StatCard: React.FC<{ title: string; value: string | number; icon: React.El
 );
 
 type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
+type ShopPeriod = '1' | '7' | '15' | '30';
+type ShopDistributionKey = 'source' | 'item' | 'time' | 'region';
+
+const SHOP_PERIOD_OPTIONS: Array<{ key: ShopPeriod; label: string }> = [
+  { key: '1', label: '近1天' },
+  { key: '7', label: '近7天' },
+  { key: '15', label: '近15天' },
+  { key: '30', label: '近30天' },
+];
+
+const SHOP_DISTRIBUTION_OPTIONS: Array<{ key: ShopDistributionKey; label: string }> = [
+  { key: 'source', label: '来源分布' },
+  { key: 'time', label: '时间分布' },
+  { key: 'region', label: '地域分布' },
+  { key: 'item', label: '商品分布' },
+];
 
 const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<AdminStats | null>(null);
@@ -69,6 +85,12 @@ const Dashboard: React.FC = () => {
   // 商品列表
   const [items, setItems] = useState<Item[]>([]);
   const [itemNames, setItemNames] = useState<Record<string, string>>({});
+  const [shopOverview, setShopOverview] = useState<ShopOverview | null>(null);
+  const [shopAccount, setShopAccount] = useState('');
+  const [shopPeriod, setShopPeriod] = useState<ShopPeriod>('1');
+  const [shopDistribution, setShopDistribution] = useState<ShopDistributionKey>('source');
+  const [shopLoading, setShopLoading] = useState(false);
+  const [shopError, setShopError] = useState('');
 
   // 颜色配置
   const COLORS = ['#FFE815', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
@@ -267,6 +289,44 @@ const Dashboard: React.FC = () => {
     }).catch(console.error);
   }, [timeRange]);
 
+  useEffect(() => {
+    getShopOverview()
+      .then((data) => {
+        setShopOverview(data);
+        setShopAccount((current) => (
+          current && data.accounts.some(account => account.cookie_id === current)
+            ? current
+            : data.accounts.find(account => account.status === 'ready')?.cookie_id
+              || data.accounts[0]?.cookie_id
+              || ''
+        ));
+      })
+      .catch((error) => setShopError(error?.message || '经营数据加载失败'));
+  }, []);
+
+  const handleShopRefresh = async () => {
+    setShopLoading(true);
+    setShopError('');
+    try {
+      const data = await refreshShopOverview(shopAccount || undefined);
+      setShopOverview(data);
+      if (!shopAccount) {
+        setShopAccount(
+          data.accounts.find(account => account.status === 'ready')?.cookie_id
+            || data.accounts[0]?.cookie_id
+            || ''
+        );
+      }
+      if (data.errors?.length) {
+        setShopError(data.errors.map(item => `${item.cookie_id}: ${item.message}`).join('；'));
+      }
+    } catch (error: any) {
+      setShopError(error?.message || '经营数据同步失败');
+    } finally {
+      setShopLoading(false);
+    }
+  };
+
   // 加载订单列表
   useEffect(() => {
     const { startDate, endDate } = getDatesForRange(timeRange);
@@ -314,6 +374,32 @@ const Dashboard: React.FC = () => {
   const itemStats = analytics.item_stats || [];
   const totalOrders = analytics.revenue_stats.total_orders || 0;
   const totalAmount = analytics.revenue_stats.total_amount || 0;
+  const selectedShopProfile = shopOverview?.accounts.find(account => account.cookie_id === shopAccount);
+  const selectedShopPeriod = selectedShopProfile?.shop_data?.periods?.[shopPeriod];
+  const availableDistributions = SHOP_DISTRIBUTION_OPTIONS.filter(
+    option => Boolean(selectedShopPeriod?.distributions?.[option.key]?.items?.length)
+  );
+  const activeDistributionKey = availableDistributions.some(option => option.key === shopDistribution)
+    ? shopDistribution
+    : availableDistributions[0]?.key;
+  const activeDistribution = activeDistributionKey
+    ? selectedShopPeriod?.distributions?.[activeDistributionKey]
+    : undefined;
+  const distributionMax = Math.max(
+    1,
+    ...(activeDistribution?.items || []).map(item => Number(item.value) || 0)
+  );
+  const latestShopUpdate = selectedShopProfile?.updated_at || '';
+
+  const formatShopMetricValue = (value: number, valueType?: string) => {
+    if (valueType?.includes('PERCENTAGE')) {
+      return `${Number(value || 0).toFixed(valueType.includes('TWO_DECIMAL') ? 2 : 0)}%`;
+    }
+    if (valueType === 'TWO_DECIMAL') {
+      return Number(value || 0).toFixed(2);
+    }
+    return Number(value || 0).toLocaleString();
+  };
 
   // 1. 商品销量排行：按订单数量排序
   const productSalesData = itemStats.length > 0 ? itemStats
@@ -385,6 +471,207 @@ const Dashboard: React.FC = () => {
           </div>
         </div>
       </div>
+
+      <section className="bg-white border border-gray-100 rounded-lg overflow-hidden shadow-sm">
+        <div className="px-5 py-4 border-b border-gray-100 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            {selectedShopProfile?.avatar ? (
+              <img
+                src={selectedShopProfile.avatar}
+                alt=""
+                className="w-10 h-10 rounded-lg object-cover bg-gray-100"
+              />
+            ) : (
+              <div className="w-10 h-10 rounded-lg bg-[#FFE815] flex items-center justify-center">
+                <Store className="w-5 h-5 text-gray-900" />
+              </div>
+            )}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h3 className="font-bold text-gray-900 truncate">
+                  {selectedShopProfile?.shop_name || selectedShopProfile?.nickname || '小铺数据'}
+                </h3>
+                {selectedShopProfile?.is_shop && (
+                  <span title="鱼小铺账号">
+                    <BadgeCheck className="w-4 h-4 text-amber-500" />
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-gray-400 mt-0.5">
+                {selectedShopPeriod?.data_date
+                  ? `数据更新至 ${selectedShopPeriod.data_date}`
+                  : latestShopUpdate
+                    ? `同步于 ${latestShopUpdate}`
+                    : shopLoading ? '正在同步' : '尚未同步'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              value={shopAccount}
+              onChange={(event) => setShopAccount(event.target.value)}
+              className="h-10 min-w-40 max-w-56 px-3 rounded-lg border border-gray-200 bg-white text-sm font-medium text-gray-700 outline-none focus:border-yellow-400"
+              aria-label="选择鱼小铺账号"
+            >
+              {!shopOverview?.accounts.length && <option value="">暂无账号</option>}
+              {shopOverview?.accounts.map(account => (
+                <option key={account.cookie_id} value={account.cookie_id}>
+                  {account.account_label || account.nickname || account.cookie_id}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={handleShopRefresh}
+              disabled={shopLoading || !shopAccount}
+              className="w-10 h-10 rounded-lg border border-gray-200 inline-flex items-center justify-center text-gray-600 hover:text-black hover:border-yellow-400 disabled:opacity-50 transition-colors"
+              title="同步当前账号小铺数据"
+            >
+              <RefreshCw className={`w-4 h-4 ${shopLoading ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
+        </div>
+
+        <div className="px-5 pt-5 flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div>
+            <h4 className="text-base font-bold text-gray-900">数据概览</h4>
+            <p className="text-xs text-gray-400 mt-1">数据来自鱼小铺官方数据中心</p>
+          </div>
+          <div className="inline-flex w-fit p-1 rounded-lg bg-gray-100">
+            {SHOP_PERIOD_OPTIONS.map(option => (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => setShopPeriod(option.key)}
+                className={`h-8 px-3 rounded-md text-xs font-bold transition-colors ${
+                  shopPeriod === option.key
+                    ? 'bg-white text-gray-900 shadow-sm'
+                    : 'text-gray-500 hover:text-gray-900'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {selectedShopPeriod ? (
+          <>
+            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 mt-4 border-y border-gray-100 divide-x divide-y xl:divide-y-0 divide-gray-100">
+              {selectedShopPeriod.overview.map(metric => (
+                <div key={metric.type} className="px-5 py-4 min-w-0">
+                  <div className="text-xs text-gray-500 truncate" title={metric.name}>{metric.name}</div>
+                  <div className="mt-2 text-2xl font-extrabold text-gray-900 tabular-nums">
+                    {formatShopMetricValue(metric.value, metric.value_type)}
+                  </div>
+                  <div className={`mt-1 text-xs tabular-nums ${
+                    Number(metric.change || 0) > 0
+                      ? 'text-red-500'
+                      : Number(metric.change || 0) < 0 ? 'text-emerald-600' : 'text-gray-400'
+                  }`}>
+                    {metric.tips || '较前期'} {metric.change === null || metric.change === undefined
+                      ? '-'
+                      : `${Number(metric.change) > 0 ? '+' : ''}${Number(metric.change).toFixed(0)}%`}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="px-5 py-5 border-b border-gray-100">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <h4 className="text-base font-bold text-gray-900">浏览分布</h4>
+                <div className="flex flex-wrap gap-2">
+                  {SHOP_DISTRIBUTION_OPTIONS.map(option => {
+                    const available = availableDistributions.some(item => item.key === option.key);
+                    const active = activeDistributionKey === option.key;
+                    return (
+                      <button
+                        key={option.key}
+                        type="button"
+                        disabled={!available}
+                        onClick={() => setShopDistribution(option.key)}
+                        className={`h-8 px-3 rounded-md text-xs font-bold border transition-colors ${
+                          active
+                            ? 'bg-[#FFE815] border-[#FFE815] text-gray-900'
+                            : available
+                              ? 'bg-white border-gray-200 text-gray-600 hover:border-gray-400'
+                              : 'bg-gray-50 border-gray-100 text-gray-300 cursor-not-allowed'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {activeDistribution?.items?.length ? (
+                <div className="mt-5 grid grid-cols-1 xl:grid-cols-2 gap-x-10 gap-y-3">
+                  {activeDistribution.items.map((item, index) => (
+                    <div
+                      key={`${item.name}-${index}`}
+                      className="grid grid-cols-[minmax(72px,112px)_minmax(100px,1fr)_52px] items-center gap-3 min-w-0"
+                    >
+                      <span className="text-sm text-gray-600 truncate text-right" title={item.name}>
+                        {item.name}
+                      </span>
+                      <div className="h-7 bg-gray-100 overflow-hidden rounded-sm">
+                        <div
+                          className="h-full bg-blue-500 rounded-sm"
+                          style={{ width: `${Math.max(2, (Number(item.value) / distributionMax) * 100)}%` }}
+                        />
+                      </div>
+                      <span className="text-sm font-bold text-gray-800 tabular-nums text-right">
+                        {formatShopMetricValue(item.value, item.value_type)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="h-32 flex items-center justify-center text-sm text-gray-400">
+                  当前周期暂无浏览分布数据
+                </div>
+              )}
+            </div>
+
+            <div className="px-5 py-5">
+              <div className="flex flex-col md:flex-row md:items-end justify-between gap-2">
+                <div>
+                  <h4 className="text-base font-bold text-gray-900">复购情况</h4>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {selectedShopPeriod.repurchase.tips || '闲鱼官方复购统计'}
+                  </p>
+                </div>
+                <span className="text-xs text-gray-400">{SHOP_PERIOD_OPTIONS.find(option => option.key === shopPeriod)?.label}</span>
+              </div>
+              <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 border border-gray-100 rounded-lg divide-y sm:divide-y-0 sm:divide-x divide-gray-100">
+                {selectedShopPeriod.repurchase.metrics.map(metric => (
+                  <div key={metric.type} className="px-5 py-4">
+                    <div className="text-xs text-gray-500">{metric.name}</div>
+                    <div className="mt-2 text-2xl font-extrabold text-gray-900 tabular-nums">
+                      {formatShopMetricValue(metric.value, metric.value_type)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="min-h-64 px-5 flex flex-col items-center justify-center text-center border-t border-gray-100 mt-5">
+            <BarChart3 className="w-8 h-8 text-gray-300 mb-3" />
+            <p className="text-sm font-medium text-gray-600">
+              {selectedShopProfile?.status === 'not_synced' ? '该账号尚未同步小铺数据' : '当前账号暂无官方小铺数据'}
+            </p>
+            <p className="text-xs text-gray-400 mt-1">点击右上角刷新按钮获取</p>
+          </div>
+        )}
+
+        {shopError && (
+          <div className="px-5 py-2.5 border-t border-red-100 bg-red-50 text-xs text-red-600 truncate" title={shopError}>
+            {shopError}
+          </div>
+        )}
+      </section>
 
       {/* Time Range Selector */}
       <div className="flex flex-wrap gap-2 p-2 bg-gray-100/50 rounded-2xl">

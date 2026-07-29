@@ -18,6 +18,7 @@ import pandas as pd
 import io
 import asyncio
 from collections import defaultdict
+from datetime import date
 
 import cookie_manager
 from db_manager import db_manager
@@ -56,6 +57,14 @@ qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed':
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
+
+
+async def _await_cookie_manager_action(action):
+    """Wait for CookieManager tasks scheduled on the current event loop."""
+    if asyncio.isfuture(action) or asyncio.iscoroutine(action):
+        return await action
+    return action
+
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
@@ -1361,11 +1370,33 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
+        connection_state = 'offline'
+        connection_reason = ''
+        connected = False
+        try:
+            from XianyuAutoAsync import XianyuLive
+            live_instance = XianyuLive.get_instance(cookie_id)
+            if live_instance:
+                state = getattr(live_instance, 'connection_state', None)
+                connection_state = getattr(state, 'value', str(state or 'connecting'))
+                connection_reason = getattr(live_instance, 'connection_reason', '')
+                connected = connection_state == 'connected'
+            else:
+                cached_status = XianyuLive.get_cached_connection_status(cookie_id)
+                if cached_status:
+                    connection_state = cached_status.get('state', connection_state)
+                    connection_reason = cached_status.get('reason', '')
+        except Exception as state_error:
+            logger.debug(f"获取账号 {cookie_id} 实时连接状态失败: {state_error}")
 
         result.append({
             'id': cookie_id,
             'value': cookie_value,
             'enabled': cookie_enabled,
+            'connected': connected,
+            'connection_state': connection_state,
+            'connection_reason': connection_reason,
+            'login_required': bool(cookie_enabled and connection_state in ('offline', 'failed', 'closed')),
             'auto_confirm': auto_confirm,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
@@ -1820,7 +1851,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     temp_xianyu = XianyuLive(
                         cookies_str=cookies_str,
                         cookie_id=account_id,
-                        user_id=user_id
+                        user_id=user_id,
+                        register_instance=False,
                     )
                     
                     # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
@@ -1851,6 +1883,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                             log_with_user('error', f"刷新Cookie时出错: {account_id}, 错误: {str(refresh_e)}", current_user)
                             import traceback
                             logger.error(traceback.format_exc())
+                        finally:
+                            await temp_xianyu.close_session()
                     
                     # 在后台线程中运行异步任务
                     # 由于run_login是在线程中运行的，需要创建新的事件循环
@@ -2320,6 +2354,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
         # 第一步：使用扫码cookie获取真实cookie
         log_with_user('info', f"开始使用扫码cookie获取真实cookie: {account_id}", current_user)
 
+        temp_instance = None
         try:
             # 创建一个临时的XianyuLive实例来执行cookie刷新
             from XianyuAutoAsync import XianyuLive
@@ -2328,7 +2363,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             temp_instance = XianyuLive(
                 cookies_str=cookies,
                 cookie_id=account_id,
-                user_id=user_id
+                user_id=user_id,
+                register_instance=False,
             )
 
             # 执行cookie刷新获取真实cookie
@@ -2350,11 +2386,21 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     # 第二步：将真实cookie添加到cookie_manager（如果是新账号）或更新现有账号
                     if cookie_manager.manager:
                         if is_new_account:
-                            cookie_manager.manager.add_cookie(account_id, real_cookies)
+                            action = cookie_manager.manager.add_cookie(
+                                account_id,
+                                real_cookies,
+                                user_id=user_id,
+                            )
+                            await _await_cookie_manager_action(action)
                             log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
                         else:
                             # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                            cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
+                            action = cookie_manager.manager.update_cookie(
+                                account_id,
+                                real_cookies,
+                                save_to_db=False,
+                            )
+                            await _await_cookie_manager_action(action)
                             log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
 
                     return {
@@ -2376,6 +2422,9 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
             # 降级处理：使用原始扫码cookie
             return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, f"获取真实cookie异常: {str(refresh_e)}")
+        finally:
+            if temp_instance is not None:
+                await temp_instance.close_session()
 
     except Exception as e:
         log_with_user('error', f"处理扫码登录Cookie失败: {str(e)}", current_user)
@@ -2399,11 +2448,21 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
         # 添加到或更新cookie_manager
         if cookie_manager.manager:
             if is_new_account:
-                cookie_manager.manager.add_cookie(account_id, cookies)
+                action = cookie_manager.manager.add_cookie(
+                    account_id,
+                    cookies,
+                    user_id=user_id,
+                )
+                await _await_cookie_manager_action(action)
                 log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
             else:
                 # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, cookies, save_to_db=False)
+                action = cookie_manager.manager.update_cookie(
+                    account_id,
+                    cookies,
+                    save_to_db=False,
+                )
+                await _await_cookie_manager_action(action)
                 log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
 
         return {
@@ -2444,15 +2503,19 @@ async def refresh_cookies_from_qr_login(
         temp_instance = XianyuLive(
             cookies_str=qr_cookies,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         # 执行cookie刷新
-        success = await temp_instance.refresh_cookies_from_qr_login(
-            qr_cookies_str=qr_cookies,
-            cookie_id=cookie_id,
-            user_id=current_user['user_id']
-        )
+        try:
+            success = await temp_instance.refresh_cookies_from_qr_login(
+                qr_cookies_str=qr_cookies,
+                cookie_id=cookie_id,
+                user_id=current_user['user_id']
+            )
+        finally:
+            await temp_instance.close_session()
 
         if success:
             log_with_user('info', f"扫码cookie刷新成功: {cookie_id}", current_user)
@@ -2463,7 +2526,12 @@ async def refresh_cookies_from_qr_login(
                 updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
                 if updated_cookie_info:
                     # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                    cookie_manager.manager.update_cookie(cookie_id, updated_cookie_info['cookies_str'], save_to_db=False)
+                    action = cookie_manager.manager.update_cookie(
+                        cookie_id,
+                        updated_cookie_info['cookies_str'],
+                        save_to_db=False,
+                    )
+                    await _await_cookie_manager_action(action)
                     log_with_user('info', f"已更新cookie_manager中的cookie: {cookie_id}", current_user)
 
             return {
@@ -4831,7 +4899,7 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(cookies_str, cookie_id, register_instance=False)
 
         # 调用获取所有商品信息的方法（自动分页）
         logger.info(f"开始获取账号 {cookie_id} 的所有商品信息")
@@ -4897,7 +4965,7 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(cookies_str, cookie_id, register_instance=False)
 
         # 调用获取指定页商品信息的方法
         logger.info(f"开始获取账号 {cookie_id} 第{page_number}页商品信息（每页{page_size}条）")
@@ -5411,6 +5479,183 @@ def get_valid_orders(
     except Exception as e:
         log_with_user('error', f"获取有效订单列表失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _build_shop_overview_response(user_id: int, metric_date: str):
+    """组合账号经营快照，并为尚未同步的账号保留占位项。"""
+    cached_rows = db_manager.get_account_shop_metrics(user_id, metric_date)
+    cached_map = {str(row['cookie_id']): row for row in cached_rows}
+    accounts = []
+    for cookie_id in db_manager.get_all_cookies(user_id).keys():
+        details = db_manager.get_cookie_details(cookie_id) or {}
+        account = cached_map.get(str(cookie_id))
+        if account:
+            account['status'] = 'ready'
+            account['account_label'] = (
+                details.get('remark')
+                or account.get('nickname')
+                or str(cookie_id)
+            )
+            accounts.append(account)
+            continue
+        accounts.append({
+            'cookie_id': str(cookie_id),
+            'metric_date': metric_date,
+            'nickname': details.get('remark') or str(cookie_id),
+            'account_label': details.get('remark') or str(cookie_id),
+            'avatar': '',
+            'shop_name': '',
+            'is_shop': False,
+            'followers': 0,
+            'following': 0,
+            'sold_count': 0,
+            'item_count': len(db_manager.get_items_by_cookie(cookie_id)),
+            'first_browse_total': 0,
+            'browse_total': 0,
+            'today_browse': 0,
+            'collect_total': 0,
+            'want_total': 0,
+            'today_exposure': None,
+            'exposure_source': '',
+            'shop_data': {
+                'source': 'official_data_center',
+                'supported_days': [1, 7, 15, 30],
+                'periods': {},
+            },
+            'updated_at': '',
+            'status': 'not_synced',
+        })
+
+    ready_accounts = [item for item in accounts if item.get('status') == 'ready']
+    official_values = [item.get('today_exposure') for item in ready_accounts]
+    all_official = bool(ready_accounts) and all(value is not None for value in official_values)
+    return {
+        'metric_date': metric_date,
+        'accounts': accounts,
+        'totals': {
+            'today_exposure': (
+                sum(int(value or 0) for value in official_values)
+                if all_official else None
+            ),
+            'today_browse': sum(int(item.get('today_browse') or 0) for item in ready_accounts),
+            'browse_total': sum(int(item.get('browse_total') or 0) for item in ready_accounts),
+            'collect_total': sum(int(item.get('collect_total') or 0) for item in ready_accounts),
+            'want_total': sum(int(item.get('want_total') or 0) for item in ready_accounts),
+            'followers': sum(int(item.get('followers') or 0) for item in ready_accounts),
+            'sold_count': sum(int(item.get('sold_count') or 0) for item in ready_accounts),
+            'item_count': sum(int(item.get('item_count') or 0) for item in ready_accounts),
+        },
+    }
+
+
+@app.get('/analytics/shop-overview')
+def get_shop_overview(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """读取今天已缓存的账号曝光/浏览及小铺数据。"""
+    try:
+        return _build_shop_overview_response(
+            current_user['user_id'],
+            date.today().isoformat(),
+        )
+    except Exception as exc:
+        log_with_user('error', f"读取账号经营数据失败: {exc}", current_user)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post('/analytics/shop-overview/refresh')
+async def refresh_shop_overview(
+    request: Optional[dict] = Body(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """使用在线闲鱼账号刷新鱼小铺官方数据中心指标。"""
+    from XianyuAutoAsync import XianyuLive
+
+    user_id = current_user['user_id']
+    metric_date = date.today().isoformat()
+    user_cookies = db_manager.get_all_cookies(user_id)
+    requested_cookie_id = str((request or {}).get('cookie_id') or '').strip()
+    if requested_cookie_id:
+        if requested_cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail='无权刷新该账号')
+        user_cookies = {requested_cookie_id: user_cookies[requested_cookie_id]}
+
+    errors = []
+    cached_metrics = {
+        str(item.get('cookie_id')): item
+        for item in db_manager.get_account_shop_metrics(user_id, metric_date)
+    }
+    for cookie_id, cookies_str in user_cookies.items():
+        # 实时 WebSocket 实例可能运行在 CookieManager 的独立事件循环中，
+        # 不能在 FastAPI 请求循环里复用它的 aiohttp session。
+        live_instance = XianyuLive.get_instance(cookie_id)
+        instance = None
+        try:
+            instance = XianyuLive(
+                cookies_str,
+                cookie_id,
+                user_id=user_id,
+                register_instance=False,
+            )
+            item_ids = [
+                str(item.get('item_id'))
+                for item in db_manager.get_items_by_cookie(cookie_id)
+                if item.get('item_id')
+            ]
+            metrics = await instance.get_account_shop_overview(item_ids)
+            incoming_shop_data = metrics.get('shop_data') or {}
+            incoming_periods = incoming_shop_data.get('periods') or {}
+            if not incoming_periods:
+                raise RuntimeError('官方数据中心未返回有效周期，已保留上次同步结果')
+
+            existing = cached_metrics.get(str(cookie_id)) or {}
+            existing_shop_data = existing.get('shop_data') or {}
+            existing_periods = existing_shop_data.get('periods') or {}
+            if existing_periods:
+                incoming_shop_data['periods'] = {
+                    **existing_periods,
+                    **incoming_periods,
+                }
+
+            # 资料接口偶发失败时 tracknick 是登录名，不允许覆盖已保存的闲鱼昵称。
+            if (
+                existing
+                and metrics.get('nickname_source') != 'official_profile'
+            ):
+                metrics['nickname'] = existing.get('nickname') or metrics.get('nickname')
+                metrics['avatar'] = existing.get('avatar') or metrics.get('avatar')
+                metrics['shop_name'] = existing.get('shop_name') or metrics.get('shop_name')
+                metrics['is_shop'] = existing.get('is_shop', metrics.get('is_shop'))
+
+            metrics['metric_date'] = metric_date
+            db_manager.save_account_shop_metrics(metrics)
+            cached_metrics[str(cookie_id)] = {
+                **existing,
+                **metrics,
+            }
+
+            # 临时会话可能拿到新的H5 Cookie，同步给实时实例供后续刷新使用。
+            if live_instance is not None:
+                live_instance.cookies.update(instance.cookies)
+                live_instance.cookies_str = '; '.join(
+                    f'{key}={value}'
+                    for key, value in live_instance.cookies.items()
+                )
+            log_with_user(
+                'info',
+                f"账号 {cookie_id} 鱼小铺数据刷新成功，"
+                f"本次获取 {len(incoming_periods)} 个周期",
+                current_user,
+            )
+        except Exception as exc:
+            logger.exception(f"账号 {cookie_id} 经营数据刷新失败")
+            errors.append({'cookie_id': str(cookie_id), 'message': str(exc)})
+        finally:
+            if instance is not None:
+                await instance.close_session()
+
+    response = _build_shop_overview_response(user_id, metric_date)
+    response['success'] = not errors
+    response['errors'] = errors
+    return response
 
 # ------------------------- 指定商品回复接口 -------------------------
 

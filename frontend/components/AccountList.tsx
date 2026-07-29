@@ -30,6 +30,8 @@ const AccountList: React.FC = () => {
   const [showQRModal, setShowQRModal] = useState(false);
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [qrStatus, setQrStatus] = useState<string>('pending');
+  const [qrMessage, setQrMessage] = useState<string>('');
+  const [qrTargetAccount, setQrTargetAccount] = useState<AccountDetail | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
 
@@ -55,39 +57,51 @@ const AccountList: React.FC = () => {
   });
   const [saving, setSaving] = useState(false);
 
-  const loadAccounts = async () => {
-    setLoading(true);
+  const loadAccounts = async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
     try {
       const data = await getAccountDetails();
 
       // 获取所有账号的AI设置
       let allAISettings: Record<string, AIReplySettings> = {};
-      try {
-        allAISettings = await getAllAISettings();
-      } catch (e) {
-        console.error('Failed to load AI settings:', e);
+      if (!silent) {
+        try {
+          allAISettings = await getAllAISettings();
+        } catch (e) {
+          console.error('Failed to load AI settings:', e);
+        }
       }
 
       // 合并AI设置到账号数据
-      const accountsWithAI = data.map(account => ({
-        ...account,
-        ai_enabled: allAISettings[account.id]?.ai_enabled ?? false,
-        max_discount_percent: allAISettings[account.id]?.max_discount_percent ?? 10,
-        max_discount_amount: allAISettings[account.id]?.max_discount_amount ?? 100,
-        max_bargain_rounds: allAISettings[account.id]?.max_bargain_rounds ?? 3,
-        custom_prompts: allAISettings[account.id]?.custom_prompts ?? '',
+      setAccounts(currentAccounts => data.map(account => {
+        const currentAccount = currentAccounts.find(item => item.id === account.id);
+        const settings = silent ? currentAccount : allAISettings[account.id];
+        return {
+          ...account,
+          ai_enabled: settings?.ai_enabled ?? false,
+          max_discount_percent: settings?.max_discount_percent ?? 10,
+          max_discount_amount: settings?.max_discount_amount ?? 100,
+          max_bargain_rounds: settings?.max_bargain_rounds ?? 3,
+          custom_prompts: settings?.custom_prompts ?? '',
+        };
       }));
-
-      setAccounts(accountsWithAI);
     } catch (error) {
       console.error('Failed to load accounts:', error);
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   };
 
   useEffect(() => {
     loadAccounts();
+    const statusTimer = window.setInterval(() => {
+      loadAccounts(true);
+    }, 3000);
+    return () => window.clearInterval(statusTimer);
   }, []);
 
   const handleToggle = async (id: string, currentStatus: boolean) => {
@@ -204,9 +218,18 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const startQRLogin = async () => {
+  const closeQRModal = () => {
+    setShowQRModal(false);
+    setQrTargetAccount(null);
+    setQrMessage('');
+  };
+
+  const startQRLogin = async (targetAccount?: AccountDetail) => {
+    const target = targetAccount || null;
+    setQrTargetAccount(target);
     setShowQRModal(true);
     setQrStatus('loading');
+    setQrMessage('');
     try {
       const res = await generateQRLogin();
       if (res.success && res.qr_code_url && res.session_id) {
@@ -217,19 +240,32 @@ const AccountList: React.FC = () => {
           const statusRes = await checkQRLoginStatus(res.session_id!);
           if (statusRes.status === 'success') {
             clearInterval(interval);
-            setQrStatus('success');
-            setTimeout(() => {
-              setShowQRModal(false);
+            const actualAccountId = statusRes.account_info?.account_id;
+            if (target && actualAccountId && actualAccountId !== target.id) {
+              setQrStatus('error');
+              setQrMessage(`扫码账号不匹配，实际登录账号为 ${actualAccountId}`);
               loadAccounts();
-            }, 1000);
+              return;
+            }
+            setQrStatus('success');
+            setQrMessage(target ? '账号凭证已更新，实时任务正在恢复' : '登录成功');
+            setTimeout(() => {
+              closeQRModal();
+              loadAccounts();
+            }, 1500);
           } else if (statusRes.status === 'expired' || statusRes.status === 'error') {
             clearInterval(interval);
             setQrStatus('error');
+            setQrMessage(statusRes.message || '二维码已失效，请重试');
           }
         }, 2000);
+      } else {
+        setQrStatus('error');
+        setQrMessage(res.message || '二维码生成失败');
       }
     } catch (e) {
       setQrStatus('error');
+      setQrMessage(e instanceof Error ? e.message : '二维码生成失败');
     }
   };
 
@@ -243,11 +279,11 @@ const AccountList: React.FC = () => {
           <p className="text-gray-500 mt-2 font-medium">管理您的闲鱼授权账号及设置。</p>
         </div>
         <button
-            onClick={startQRLogin}
+            onClick={() => startQRLogin()}
             className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 transition-transform hover:scale-105 active:scale-95"
         >
           <QrCode className="w-5 h-5" />
-          扫码添加新账号
+          扫码登录
         </button>
       </div>
 
@@ -262,17 +298,35 @@ const AccountList: React.FC = () => {
                   alt="avatar"
                   className="w-20 h-20 rounded-3xl object-cover shadow-md ring-4 ring-white"
                 />
-                <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${account.enabled ? 'bg-green-500' : 'bg-gray-300'}`}>
-                    {account.enabled && <Check className="w-3 h-3 text-white" />}
+                <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${
+                  account.connected ? 'bg-green-500' : account.enabled ? 'bg-red-400' : 'bg-gray-300'
+                }`}>
+                    {account.connected && <Check className="w-3 h-3 text-white" />}
                 </div>
               </div>
               <div>
                 <div className="flex items-center gap-3 mb-1">
                     <h3 className="text-xl font-extrabold text-gray-900">{account.nickname || account.remark || `账号 ${account.id.substring(0,6)}...`}</h3>
-                    {account.enabled ? (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-green-100 text-green-700 text-xs font-bold">在线</span>
-                    ) : (
+                    {!account.enabled ? (
                         <span className="px-2.5 py-0.5 rounded-lg bg-gray-100 text-gray-500 text-xs font-bold">暂停</span>
+                    ) : account.connected ? (
+                        <span className="px-2.5 py-0.5 rounded-lg bg-green-100 text-green-700 text-xs font-bold">在线</span>
+                    ) : account.connection_state === 'verifying' ? (
+                        <span
+                          className="px-2.5 py-0.5 rounded-lg bg-amber-100 text-amber-700 text-xs font-bold"
+                          title={account.connection_reason || '请在弹出的浏览器中完成验证'}
+                        >
+                          验证中
+                        </span>
+                    ) : account.connection_state === 'connecting' || account.connection_state === 'reconnecting' ? (
+                        <span className="px-2.5 py-0.5 rounded-lg bg-blue-100 text-blue-700 text-xs font-bold">连接中</span>
+                    ) : (
+                        <span
+                          className="px-2.5 py-0.5 rounded-lg bg-red-50 text-red-600 text-xs font-bold"
+                          title={account.connection_reason || '账号连接已停止'}
+                        >
+                          {account.connection_reason?.includes('验证') || account.connection_reason?.includes('风控') ? '需验证' : '需重登'}
+                        </span>
                     )}
                     {account.ai_enabled && (
                         <span className="px-2.5 py-0.5 rounded-lg bg-purple-100 text-purple-700 text-xs font-bold flex items-center gap-1">
@@ -288,6 +342,14 @@ const AccountList: React.FC = () => {
               </div>
             </div>
             <div className="flex items-center gap-3">
+                <button
+                    onClick={() => startQRLogin(account)}
+                    className="px-3 py-2.5 rounded-xl hover:bg-yellow-50 transition-colors text-amber-700 font-bold text-sm flex items-center gap-2"
+                    title="使用该闲鱼账号扫码更新登录凭证"
+                >
+                    <QrCode className="w-4 h-4" />
+                    扫码重登
+                </button>
                 <button
                     onClick={() => openEditModal(account)}
                     className="p-3 rounded-xl hover:bg-gray-100 transition-colors text-gray-600"
@@ -334,7 +396,7 @@ const AccountList: React.FC = () => {
           <div className="modal-overlay-centered">
               <div className="modal-container" style={{maxWidth: '24rem'}}>
                   <button
-                    onClick={() => setShowQRModal(false)}
+                    onClick={closeQRModal}
                     className="self-end p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors mb-6"
                   >
                     <X className="w-5 h-5 text-gray-600" />
@@ -342,8 +404,14 @@ const AccountList: React.FC = () => {
 
                   <div className="modal-body">
                       <div className="text-center">
-                          <h3 className="text-2xl font-extrabold text-gray-900 mb-2">扫码登录</h3>
-                          <p className="text-gray-500 mb-8 font-medium">请打开闲鱼APP扫描下方二维码</p>
+                          <h3 className="text-2xl font-extrabold text-gray-900 mb-2">
+                            {qrTargetAccount ? '扫码重新登录' : '扫码登录'}
+                          </h3>
+                          <p className="text-gray-500 mb-8 font-medium">
+                            {qrTargetAccount
+                              ? `请使用「${qrTargetAccount.nickname || qrTargetAccount.remark || qrTargetAccount.id}」对应的闲鱼账号扫描`
+                              : '请打开闲鱼APP扫描下方二维码'}
+                          </p>
 
                           <div className="w-64 h-64 bg-[#F7F8FA] rounded-[2rem] mx-auto flex items-center justify-center overflow-hidden border-4 border-white shadow-inner mb-8 relative">
                               {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
@@ -353,13 +421,13 @@ const AccountList: React.FC = () => {
                                       <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
                                          <Check className="w-8 h-8" />
                                       </div>
-                                      <span className="font-bold text-lg">登录成功</span>
+                                      <span className="font-bold text-lg">{qrMessage || '登录成功'}</span>
                                   </div>
                               )}
                               {qrStatus === 'error' && (
                                   <div className="flex flex-col items-center">
-                                      <span className="text-red-500 font-bold mb-2">获取失败</span>
-                                      <button onClick={startQRLogin} className="text-xs bg-gray-200 px-3 py-1 rounded-full flex items-center gap-1 hover:bg-gray-300"><RefreshCw className="w-3 h-3"/> 重试</button>
+                                      <span className="text-red-500 font-bold mb-2">{qrMessage || '获取失败'}</span>
+                                      <button onClick={() => startQRLogin(qrTargetAccount || undefined)} className="text-xs bg-gray-200 px-3 py-1 rounded-full flex items-center gap-1 hover:bg-gray-300"><RefreshCw className="w-3 h-3"/> 重试</button>
                                   </div>
                               )}
                           </div>

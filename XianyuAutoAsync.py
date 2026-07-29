@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -32,6 +33,7 @@ class ConnectionState(Enum):
     DISCONNECTED = "disconnected"  # 未连接
     CONNECTING = "connecting"  # 连接中
     CONNECTED = "connected"  # 已连接
+    VERIFYING = "verifying"  # 等待人工完成风控验证
     RECONNECTING = "reconnecting"  # 重连中
     FAILED = "failed"  # 连接失败
     CLOSED = "closed"  # 已关闭
@@ -178,6 +180,9 @@ class XianyuLive:
     # 类级别的实例管理字典，用于API调用
     _instances = {}  # {cookie_id: XianyuLive实例}
     _instances_lock = asyncio.Lock()
+    _connection_status_cache = {}  # 实例退出后保留最后一次连接状态
+    # 扫码成功时间需要跨临时实例和正式实时实例传递。
+    _recent_qr_login_times = {}  # {cookie_id: timestamp}
     
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
@@ -195,6 +200,12 @@ class XianyuLive:
 
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
+        self.connection_reason = reason
+        XianyuLive._connection_status_cache[str(self.cookie_id)] = {
+            "state": new_state.value,
+            "reason": reason,
+            "updated_at": time.time(),
+        }
         if self.connection_state != new_state:
             old_state = self.connection_state
             self.connection_state = new_state
@@ -637,7 +648,13 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None):
+    def __init__(
+        self,
+        cookies_str=None,
+        cookie_id: str = "default",
+        user_id: int = None,
+        register_instance: bool = True,
+    ):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -716,7 +733,10 @@ class XianyuLive:
         self.item_sync_lock = asyncio.Lock()  # 使用Lock防止重复执行商品同步
 
         # 扫码登录Cookie刷新标志
-        self.last_qr_cookie_refresh_time = 0  # 记录上次扫码登录Cookie刷新时间
+        self.last_qr_cookie_refresh_time = XianyuLive._recent_qr_login_times.get(
+            str(cookie_id),
+            0,
+        )
         self.qr_cookie_refresh_cooldown = 600  # 扫码登录Cookie刷新后的冷却时间：10分钟
 
         # 消息接收标识 - 用于控制Cookie刷新
@@ -734,10 +754,16 @@ class XianyuLive:
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
+        self.connection_reason = ""
         self.connection_failures = 0  # 连续连接失败次数
         self.max_connection_failures = 5  # 最大连续失败次数
         self.last_successful_connection = 0  # 上次成功连接时间
         self.last_state_change_time = time.time()  # 上次状态变化时间
+        self.password_login_blocked = False  # 确定性账密错误后停止自动续登
+        self.password_login_block_reason = ""
+        self._blocked_credential_fingerprint = ""
+        self.reconnect_blocked = False
+        self.reconnect_block_reason = ""
 
         # 后台任务追踪（用于清理未等待的任务）
         self.background_tasks = set()  # 追踪所有后台任务
@@ -764,8 +790,10 @@ class XianyuLive:
         # 初始化订单状态处理器
         self._init_order_status_handler()
 
-        # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        # 临时 API/登录实例不能覆盖正在运行的实时任务实例。
+        self._is_registered_instance = False
+        if register_instance:
+            self._register_instance()
 
     def _init_order_status_handler(self):
         """初始化订单状态处理器"""
@@ -783,6 +811,7 @@ class XianyuLive:
         try:
             # 使用同步方式注册，避免在__init__中使用async
             XianyuLive._instances[self.cookie_id] = self
+            self._is_registered_instance = True
             logger.warning(f"【{self.cookie_id}】实例已注册到全局字典")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注册实例失败: {self._safe_str(e)}")
@@ -790,8 +819,9 @@ class XianyuLive:
     def _unregister_instance(self):
         """从类级别字典中注销当前实例"""
         try:
-            if self.cookie_id in XianyuLive._instances:
+            if XianyuLive._instances.get(self.cookie_id) is self:
                 del XianyuLive._instances[self.cookie_id]
+                self._is_registered_instance = False
                 logger.warning(f"【{self.cookie_id}】实例已从全局字典中注销")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注销实例失败: {self._safe_str(e)}")
@@ -800,6 +830,11 @@ class XianyuLive:
     def get_instance(cls, cookie_id: str):
         """获取指定cookie_id的XianyuLive实例"""
         return cls._instances.get(cookie_id)
+
+    @classmethod
+    def get_cached_connection_status(cls, cookie_id: str):
+        """获取实例退出前保留的最后连接状态。"""
+        return dict(cls._connection_status_cache.get(str(cookie_id), {}))
 
     @classmethod
     def get_all_instances(cls):
@@ -1964,8 +1999,8 @@ class XianyuLive:
             try:
                 from db_manager import db_manager
                 account_info = db_manager.get_cookie_details(self.cookie_id)
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
+                if account_info and account_info.get('value'):
+                    new_cookies_str = account_info.get('value')
                     if new_cookies_str != self.cookies_str:
                         logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                         self.cookies_str = new_cookies_str
@@ -2365,29 +2400,57 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
+                interactive_verification = (
+                    os.name == "nt"
+                    or bool(os.getenv("DISPLAY"))
+                ) and not os.getenv("DOCKER_ENV")
+                if not interactive_verification:
+                    self.reconnect_blocked = True
+                    self.reconnect_block_reason = "当前运行环境无法打开人工风控验证窗口"
+                    self._set_connection_state(
+                        ConnectionState.FAILED,
+                        self.reconnect_block_reason,
+                    )
+                    logger.error(
+                        f"【{self.cookie_id}】当前环境无法打开人工验证窗口，"
+                        "已停止自动滑块和重复重连"
+                    )
+                    return None
+
+                # 风控验证必须由用户本人在可见浏览器中完成。
                 slider_stealth = XianyuSliderStealth(
-                    # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
-                    user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
-                    enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用无头模式
+                    user_id=f"{self.cookie_id}",
+                    enable_learning=False,
+                    headless=False,
                 )
 
-                # 在线程池中执行滑块验证
+                self._set_connection_state(
+                    ConnectionState.VERIFYING,
+                    "请在弹出的浏览器中完成闲鱼风控验证",
+                )
+
+                # Playwright同步API放在线程池中，避免阻塞Web服务。
                 import asyncio
                 import concurrent.futures
 
                 loop = asyncio.get_event_loop()
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证
                     success, cookies = await loop.run_in_executor(
                         executor,
-                        slider_stealth.run,
-                        verification_url
+                        slider_stealth.run_manual,
+                        verification_url,
+                        self.cookies,
+                        180,
                     )
 
                 if success and cookies:
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
+                    self.reconnect_blocked = False
+                    self.reconnect_block_reason = ""
+                    self._set_connection_state(
+                        ConnectionState.CONNECTING,
+                        "风控验证通过，正在继续连接",
+                    )
 
                     # 只提取x5sec相关的cookie值进行更新
                     updated_cookies = self.cookies.copy()  # 复制现有cookies
@@ -2468,7 +2531,19 @@ class XianyuLive:
 
                     return cookies_str
                 else:
-                    logger.error(f"【{self.cookie_id}】滑块验证失败")
+                    logger.error(f"【{self.cookie_id}】人工风控验证未完成")
+                    self.reconnect_blocked = True
+                    self.reconnect_block_reason = "风控验证未完成，请重新扫码后完成验证"
+                    self._set_connection_state(
+                        ConnectionState.FAILED,
+                        self.reconnect_block_reason,
+                    )
+                    qr_login_age = time.time() - self.last_qr_cookie_refresh_time
+                    if 0 <= qr_login_age < self.qr_cookie_refresh_cooldown:
+                        logger.error(
+                            f"【{self.cookie_id}】扫码凭证已更新，但闲鱼风控验证未通过；"
+                            "停止自动重连和旧密码登录，避免连续请求加重风控"
+                        )
 
                     # 记录滑块验证失败到日志文件
                     log_captcha_event(self.cookie_id, "滑块验证失败", False,
@@ -2705,23 +2780,6 @@ class XianyuLive:
         Returns:
             bool: 是否成功刷新Cookie
         """
-        logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
-
-        # 检查是否在密码登录冷却期内，避免重复登录
-        current_time = time.time()
-        last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
-        time_since_last_login = current_time - last_password_login
-        
-        if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
-            remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
-            logger.warning(f"【{self.cookie_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
-            logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
-            return False
-
-        # 记录到日志文件
-        log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
-            f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
-
         try:
             # 从数据库获取账号登录信息
             from db_manager import db_manager
@@ -2733,17 +2791,53 @@ class XianyuLive:
             
             # 【重要】先检查数据库中的cookie是否已经更新
             # 如果用户已经手动更新了cookie，就不需要触发密码登录刷新
-            db_cookie_value = account_info.get('cookie_value', '')
+            db_cookie_value = account_info.get('value', '')
             if db_cookie_value and db_cookie_value != self.cookies_str:
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                 self.cookies_str = db_cookie_value
                 self.cookies = trans_cookies(self.cookies_str)
+                self.password_login_blocked = False
+                self.password_login_block_reason = ""
+                self._blocked_credential_fingerprint = ""
                 logger.info(f"【{self.cookie_id}】Cookie已从数据库重新加载，跳过密码登录刷新")
                 return True
             
             username = account_info.get('username', '')
             password = account_info.get('password', '')
             show_browser = account_info.get('show_browser', False)
+            credential_fingerprint = hashlib.sha256(
+                f"{username}\0{password}".encode("utf-8")
+            ).hexdigest()
+
+            if self.password_login_blocked:
+                if credential_fingerprint == self._blocked_credential_fingerprint:
+                    logger.error(
+                        f"【{self.cookie_id}】自动密码登录已暂停（{self.password_login_block_reason}）；"
+                        "请在账号管理中更新Cookie或登录凭据后重新登录"
+                    )
+                    return False
+
+                logger.info(f"【{self.cookie_id}】检测到登录凭据已更新，解除自动密码登录暂停")
+                self.password_login_blocked = False
+                self.password_login_block_reason = ""
+                self._blocked_credential_fingerprint = ""
+
+            logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
+
+            # 检查是否在密码登录冷却期内，避免重复登录
+            current_time = time.time()
+            last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
+            time_since_last_login = current_time - last_password_login
+
+            if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
+                remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
+                logger.warning(f"【{self.cookie_id}】距离上次密码登录尝试仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
+                logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
+                return False
+
+            # 记录到日志文件
+            log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
+                f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
             
             # 检查是否配置了用户名和密码
             if not username or not password:
@@ -2759,6 +2853,9 @@ class XianyuLive:
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{self.cookie_id}】使用账号: {username}")
+
+            # 登录尝试开始时即记录时间，失败的尝试也必须进入冷却期。
+            XianyuLive._last_password_login_time[self.cookie_id] = time.time()
             
             # 创建一个通知回调包装函数，支持接收截图路径和验证链接
             async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
@@ -2784,6 +2881,9 @@ class XianyuLive:
             
             if result:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
+                self.password_login_blocked = False
+                self.password_login_block_reason = ""
+                self._blocked_credential_fingerprint = ""
                 logger.info(f"【{self.cookie_id}】Cookie内容: {result}")
                 
                 # 打印密码登录获取的Cookie字段详情
@@ -2811,9 +2911,7 @@ class XianyuLive:
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
                 logger.info(f"【{self.cookie_id}】Cookie字符串格式: {new_cookies_str[:200]}..." if len(new_cookies_str) > 200 else f"【{self.cookie_id}】Cookie字符串格式: {new_cookies_str}")
                 
-                # 记录密码登录时间，防止重复登录
-                XianyuLive._last_password_login_time[self.cookie_id] = time.time()
-                logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
+                logger.warning(f"【{self.cookie_id}】密码登录冷却期 {XianyuLive._password_login_cooldown} 秒")
                 
                 # 更新cookies并重启任务
                 update_success = await self._update_cookies_and_restart(new_cookies_str)
@@ -2831,11 +2929,39 @@ class XianyuLive:
                     return False
                     
             else:
-                logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie")
+                self.password_login_blocked = True
+                self.password_login_block_reason = "自动登录失败，需要重新登录"
+                self._blocked_credential_fingerprint = credential_fingerprint
+                logger.error(
+                    f"【{self.cookie_id}】密码登录未获取到Cookie，已停止自动续登；"
+                    "请在账号管理中重新登录"
+                )
                 return False
 
         except Exception as refresh_e:
-            logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
+            error_message = self._safe_str(refresh_e)
+            definitive_login_errors = (
+                "账密错误",
+                "账号密码错误",
+                "账号或密码错误",
+                "用户名或密码错误",
+                "账户名或登录密码不正确",
+            )
+            if any(keyword in error_message for keyword in definitive_login_errors):
+                self.password_login_blocked = True
+                self.password_login_block_reason = "账密错误"
+                if "credential_fingerprint" in locals():
+                    self._blocked_credential_fingerprint = credential_fingerprint
+                logger.error(
+                    f"【{self.cookie_id}】闲鱼登录页返回账密错误，已暂停自动密码登录；"
+                    "不会继续打开浏览器或自动重启实例"
+                )
+                logger.error(
+                    f"【{self.cookie_id}】请在账号管理中重新登录，或更新该账号的Cookie/登录凭据"
+                )
+                return False
+
+            logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {error_message}")
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
             return False
@@ -3654,6 +3780,339 @@ class XianyuLive:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
             return await self.get_item_info(item_id, retry_count + 1)
+
+    async def _request_account_mtop(self, api: str, data: dict, retry_count: int = 0):
+        """调用账号级 H5 MTOP 接口，并同步服务端刷新的 Cookie。"""
+        if not self.session:
+            await self.create_session()
+
+        data_val = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+        request_time = str(int(time.time() * 1000))
+        token = (self.cookies.get('_m_h5_tk') or '').split('_')[0]
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': request_time,
+            'sign': generate_sign(request_time, token, data_val),
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': api,
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.home.0.0',
+        }
+        url = f"https://h5api.m.goofish.com/h5/{api}/1.0/"
+
+        try:
+            async with self.session.post(
+                url,
+                params=params,
+                data={'data': data_val},
+            ) as response:
+                payload = await response.json()
+                new_cookies = {}
+                for cookie in response.headers.getall('set-cookie', []):
+                    if '=' not in cookie:
+                        continue
+                    name, value = cookie.split(';', 1)[0].split('=', 1)
+                    new_cookies[name.strip()] = value.strip()
+                if new_cookies:
+                    self.cookies.update(new_cookies)
+                    self.cookies_str = '; '.join(f'{k}={v}' for k, v in self.cookies.items())
+                    await self.update_config_cookies()
+
+                ret = payload.get('ret') or []
+                if any('SUCCESS::' in str(value) for value in ret):
+                    return payload
+                error_text = ' '.join(str(value) for value in ret)
+                if retry_count < 1 and ('TOKEN' in error_text.upper() or 'SESSION' in error_text.upper()):
+                    await asyncio.sleep(0.3)
+                    return await self._request_account_mtop(api, data, retry_count + 1)
+                return payload
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】账号经营接口 {api} 请求失败: {self._safe_str(exc)}")
+            return {'ret': [f'NETWORK_ERROR::{self._safe_str(exc)}'], 'data': {}}
+
+    @staticmethod
+    def _metric_int(value, default=0):
+        """将闲鱼接口中的数字、带逗号数字和“万”单位统一为整数。"""
+        if value is None or value == '':
+            return default
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip().replace(',', '')
+        multiplier = 10000 if text.endswith('万') else 1
+        if multiplier > 1:
+            text = text[:-1]
+        match = re.search(r'-?\d+(?:\.\d+)?', text)
+        return int(float(match.group()) * multiplier) if match else default
+
+    @classmethod
+    def _find_official_today_exposure(cls, payload):
+        """查找接口未来可能直接返回的今日曝光字段。"""
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                normalized = str(key).lower().replace('_', '')
+                is_exposure = 'exposure' in normalized or '曝光' in str(key)
+                is_today = 'today' in normalized or '今日' in str(key)
+                if is_exposure and is_today:
+                    parsed = cls._metric_int(value, default=-1)
+                    if parsed >= 0:
+                        return parsed, str(key)
+                found = cls._find_official_today_exposure(value)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for value in payload:
+                found = cls._find_official_today_exposure(value)
+                if found:
+                    return found
+        return None
+
+    @classmethod
+    def _normalize_shop_data_center_response(cls, response, days):
+        """将鱼小铺数据中心响应整理为前端稳定使用的结构。"""
+        payload = (response or {}).get('data') or {}
+        if not isinstance(payload, dict) or not payload:
+            return None
+
+        def normalize_metric(metric):
+            metric = metric if isinstance(metric, dict) else {}
+            return {
+                'type': str(metric.get('type') or ''),
+                'name': str(metric.get('name') or ''),
+                'value': metric.get('data', 0),
+                'value_type': str(metric.get('dataType') or ''),
+                'change': metric.get('change'),
+                'change_type': str(metric.get('changeType') or ''),
+                'tips': str(metric.get('tips') or ''),
+                'tab_type': str(metric.get('tabType') or ''),
+            }
+
+        overview = []
+        for chart in payload.get('statisticsChartVOList') or []:
+            if not isinstance(chart, dict):
+                continue
+            metric = normalize_metric(chart.get('statisticsData'))
+            points = (
+                ((chart.get('content') or {}).get('data') or {}).get('dataPointList')
+                or []
+            )
+            metric['trend'] = [
+                {
+                    'name': str(point.get('name') or ''),
+                    'value': point.get('value', 0),
+                }
+                for point in points
+                if isinstance(point, dict)
+            ]
+            overview.append(metric)
+
+        distribution_keys = {
+            '来源分布': 'source',
+            '商品分布': 'item',
+            '时间分布': 'time',
+            '地域分布': 'region',
+        }
+        distributions = {}
+        repurchase = {'tips': '', 'metrics': []}
+        conversion = {'steps': [], 'rates': [], 'result': None}
+
+        for block in payload.get('blockList') or []:
+            if not isinstance(block, dict):
+                continue
+            title = str(block.get('title') or '')
+            if title == '浏览分布':
+                for chart in block.get('chartVOList') or []:
+                    if not isinstance(chart, dict):
+                        continue
+                    tab_name = str(chart.get('tabName') or '')
+                    key = distribution_keys.get(tab_name)
+                    if not key:
+                        continue
+                    points = (
+                        ((chart.get('content') or {}).get('data') or {}).get('dataPointList')
+                        or []
+                    )
+                    distributions[key] = {
+                        'label': tab_name,
+                        'items': [
+                            {
+                                'name': str(point.get('name') or ''),
+                                'value': point.get('value', 0),
+                                'value_type': str(point.get('valueType') or ''),
+                            }
+                            for point in points
+                            if isinstance(point, dict)
+                        ],
+                    }
+            elif title == '复购情况':
+                statistics = (
+                    (((block.get('singleChartVO') or {}).get('content') or {}).get('data') or {})
+                    .get('statisticsData')
+                    or []
+                )
+                repurchase = {
+                    'tips': str(block.get('tips') or ''),
+                    'metrics': [
+                        normalize_metric(metric)
+                        for metric in statistics
+                        if isinstance(metric, dict)
+                    ],
+                }
+            elif title == '交易转化漏斗':
+                conversion_data = (
+                    (((block.get('singleChartVO') or {}).get('content') or {}).get('data') or {})
+                )
+                conversion = {
+                    'steps': [
+                        normalize_metric(metric)
+                        for metric in conversion_data.get('processData') or []
+                        if isinstance(metric, dict)
+                    ],
+                    'rates': [
+                        normalize_metric(metric)
+                        for metric in conversion_data.get('processRate') or []
+                        if isinstance(metric, dict)
+                    ],
+                    'result': (
+                        normalize_metric(conversion_data.get('resultRate'))
+                        if conversion_data.get('resultRate')
+                        else None
+                    ),
+                }
+
+        data_date = ''
+        try:
+            timestamp = int(str(payload.get('dataTimestamp') or '0')) / 1000
+            if timestamp > 0:
+                data_date = time.strftime('%Y-%m-%d', time.localtime(timestamp))
+        except (TypeError, ValueError, OverflowError):
+            data_date = ''
+        if not data_date:
+            data_date = str(payload.get('serverTime') or '').split(' ', 1)[0]
+
+        return {
+            'days': int(days),
+            'data_date': data_date,
+            'server_time': str(payload.get('serverTime') or ''),
+            'overview': overview,
+            'distributions': distributions,
+            'repurchase': repurchase,
+            'conversion': conversion,
+        }
+
+    async def get_account_shop_overview(self, item_ids=None):
+        """获取账号资料以及鱼小铺官方数据中心指标。"""
+        item_ids = [str(item_id) for item_id in (item_ids or []) if item_id]
+        # 账号接口串行调用，避免两个请求同时刷新 H5 Token 时互相覆盖 Cookie。
+        nav_response = await self._request_account_mtop(
+            'mtop.idle.web.user.page.nav',
+            {},
+        )
+        head_response = await self._request_account_mtop(
+            'mtop.idle.web.user.page.head',
+            {'self': True},
+        )
+        nav_data = nav_response.get('data') or {}
+        head_data = head_response.get('data') or {}
+        nav_base = ((nav_data.get('module') or {}).get('base') or {})
+        head_module = head_data.get('module') or {}
+        head_base = head_module.get('base') or {}
+        social = head_module.get('social') or {}
+        tabs = head_module.get('tabs') or {}
+        shop = head_module.get('shop') or {}
+
+        avatar_value = head_base.get('avatar') or nav_base.get('avatar') or ''
+        if isinstance(avatar_value, dict):
+            avatar_value = avatar_value.get('avatar') or avatar_value.get('url') or ''
+
+        shop_periods = {}
+        shop_period_returns = {}
+        for days in (1, 7, 15, 30):
+            response = await self._request_account_mtop(
+                'mtop.taobao.idle.pro.data.center.data.detail',
+                {'tabType': 'TRADE', 'days': days},
+            )
+            normalized = self._normalize_shop_data_center_response(response, days)
+            shop_period_returns[str(days)] = response.get('ret') or []
+            if normalized:
+                shop_periods[str(days)] = normalized
+
+        shop_data = {
+            'source': 'official_data_center',
+            'supported_days': [1, 7, 15, 30],
+            'periods': shop_periods,
+        }
+        one_day_overview = {
+            metric.get('type'): metric
+            for metric in (shop_periods.get('1') or {}).get('overview') or []
+        }
+        exposure_metric = one_day_overview.get('ITEM_EXPOSURE') or {}
+        browse_metric = one_day_overview.get('ITEM_VIEW') or {}
+        item_tab = tabs.get('item') or {}
+        official_nickname = (
+            head_base.get('displayName')
+            or nav_base.get('displayName')
+            or ''
+        )
+        nickname = (
+            official_nickname
+            or self.cookies.get('tracknick')
+            or self.cookie_id
+        )
+        shop_name = ''
+        if isinstance(shop, dict):
+            shop_name = (
+                shop.get('shopName')
+                or shop.get('displayName')
+                or shop.get('title')
+                or ''
+            )
+
+        return {
+            'cookie_id': self.cookie_id,
+            'nickname': str(nickname),
+            'nickname_source': (
+                'official_profile'
+                if official_nickname
+                else 'cookie_tracknick'
+            ),
+            'avatar': str(avatar_value or ''),
+            'shop_name': str(shop_name),
+            'is_shop': bool(shop),
+            'followers': self._metric_int(social.get('followers', nav_base.get('followers'))),
+            'following': self._metric_int(social.get('following', nav_base.get('following'))),
+            'sold_count': self._metric_int(nav_base.get('soldCount')),
+            'item_count': self._metric_int(item_tab.get('number'), len(item_ids)),
+            'browse_total': self._metric_int(browse_metric.get('value')),
+            'collect_total': 0,
+            'want_total': 0,
+            'item_metrics_count': 0,
+            'today_exposure': (
+                self._metric_int(exposure_metric.get('value'))
+                if exposure_metric
+                else None
+            ),
+            'exposure_source': (
+                'official_data_center'
+                if shop_periods
+                else ''
+            ),
+            'shop_data': shop_data,
+            'raw_data': {
+                'nav': nav_data,
+                'head': head_data,
+                'nav_ret': nav_response.get('ret') or [],
+                'head_ret': head_response.get('ret') or [],
+                'shop_data': shop_data,
+                'shop_period_returns': shop_period_returns,
+            },
+        }
 
     def extract_item_id_from_message(self, message):
         """从消息中提取商品ID的辅助方法"""
@@ -6766,6 +7225,9 @@ class XianyuLive:
 
                 # 更新扫码登录Cookie刷新时间标志
                 self.last_qr_cookie_refresh_time = time.time()
+                XianyuLive._recent_qr_login_times[str(target_cookie_id)] = (
+                    self.last_qr_cookie_refresh_time
+                )
                 logger.info(f"【{target_cookie_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执行")
 
                 return True
@@ -7105,6 +7567,7 @@ class XianyuLive:
     def reset_qr_cookie_refresh_flag(self):
         """重置扫码登录Cookie刷新标志，允许立即执行_refresh_cookies_via_browser"""
         self.last_qr_cookie_refresh_time = 0
+        XianyuLive._recent_qr_login_times.pop(str(self.cookie_id), None)
         logger.info(f"【{self.cookie_id}】已重置扫码登录Cookie刷新标志")
 
     def get_qr_cookie_refresh_remaining_time(self) -> int:
@@ -9097,6 +9560,24 @@ class XianyuLive:
                         # 更新连接状态为重连中
                         self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
+                    if self.reconnect_blocked:
+                        reason = self.reconnect_block_reason or "需要人工验证"
+                        self._set_connection_state(ConnectionState.FAILED, reason)
+                        logger.error(
+                            f"【{self.cookie_id}】{reason}，当前实例停止自动重连；"
+                            "不会继续启动滑块或使用旧密码登录"
+                        )
+                        return
+
+                    if self.password_login_blocked:
+                        reason = self.password_login_block_reason or "需要重新登录"
+                        self._set_connection_state(ConnectionState.FAILED, reason)
+                        logger.error(
+                            f"【{self.cookie_id}】检测到确定性登录失败，当前实例停止重连；"
+                            "更新Cookie或登录凭据后可重新登录"
+                        )
+                        return
+
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
@@ -9116,6 +9597,14 @@ class XianyuLive:
                                 await asyncio.sleep(2)
                                 continue
                             else:
+                                if self.password_login_blocked:
+                                    reason = self.password_login_block_reason or "需要重新登录"
+                                    self._set_connection_state(ConnectionState.FAILED, reason)
+                                    logger.error(
+                                        f"【{self.cookie_id}】自动续登已暂停，当前实例停止重连；"
+                                        "请在账号管理中重新登录后再启用该账号"
+                                    )
+                                    return
                                 logger.warning(f"【{self.cookie_id}】❌ 密码登录刷新失败，将重启实例...")
                         except Exception as refresh_e:
                             logger.error(f"【{self.cookie_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
@@ -9244,7 +9733,24 @@ class XianyuLive:
                     continue
         finally:
             # 更新连接状态为已关闭
-            self._set_connection_state(ConnectionState.CLOSED, "程序退出")
+            if self.reconnect_blocked:
+                self._set_connection_state(
+                    ConnectionState.FAILED,
+                    self.reconnect_block_reason or "需要完成风控验证"
+                )
+            elif self.password_login_blocked:
+                self._set_connection_state(
+                    ConnectionState.FAILED,
+                    self.password_login_block_reason or "需要重新登录"
+                )
+            elif self.connection_state == ConnectionState.FAILED:
+                # 保留具体失败原因，避免实例退出时退化成普通“离线”。
+                self._set_connection_state(
+                    ConnectionState.FAILED,
+                    self.connection_reason or "连接失败"
+                )
+            else:
+                self._set_connection_state(ConnectionState.CLOSED, "程序退出")
             
             # 清空当前token
             if self.current_token:

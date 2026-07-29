@@ -238,9 +238,6 @@ class RetryStrategyStats:
                 logger.info(f"{key:25s} | 总计:{stats['total']:4d} | 成功:{stats['success']:4d} | 失败:{stats['fail']:4d} | 成功率:{stats['success_rate']}")
             logger.info("=" * 60)
 
-# 全局策略统计实例
-strategy_stats = RetryStrategyStats()
-
 class XianyuSliderStealth:
     
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True):
@@ -2081,7 +2078,7 @@ class XianyuSliderStealth:
 
             # 容器还在，检查是否有验证失败提示
             logger.info(f"【{self.pure_user_id}】滑块容器仍存在，检查验证失败提示...")
-            has_failure, retry_element = self.check_verification_failure()
+            has_failure, retry_element = self.check_verification_failure(target_frame)
 
             if has_failure:
                 logger.warning(f"【{self.pure_user_id}】检测到验证失败提示，验证失败")
@@ -2132,78 +2129,65 @@ class XianyuSliderStealth:
             logger.warning(f"【{self.pure_user_id}】检查页面改变时出错: {e}")
             return False
     
-    def check_verification_failure(self):
-        """检查验证失败提示"""
+    def check_verification_failure(self, target_frame=None):
+        """检查验证失败提示，始终返回 (是否失败, 重试元素)。"""
         try:
             logger.info(f"【{self.pure_user_id}】检查验证失败提示...")
-            
-            # 等待一下让失败提示出现（由于调用前已经等待了，这里等待时间缩短）
             time.sleep(1.5)
-            
-            # 检查页面内容中是否包含验证失败相关文字
-            page_content = self.page.content()
-            failure_keywords = [
+
+            scope = target_frame or getattr(self, '_detected_slider_frame', None) or self.page
+            failure_keywords = (
                 "验证失败",
-                "点击框体重试", 
-                "重试",
-                "失败",
-                "请重试",
+                "点击框体重试",
                 "验证码错误",
-                "滑动验证失败"
-            ]
-            
-            found_failure = False
-            for keyword in failure_keywords:
-                if keyword in page_content:
-                    logger.info(f"【{self.pure_user_id}】页面内容包含失败关键词: {keyword}")
-                    found_failure = True
-                    break
-            
+                "滑动验证失败",
+            )
+
+            page_content = scope.content()
+            found_failure = next(
+                (keyword for keyword in failure_keywords if keyword in page_content),
+                None,
+            )
             if found_failure:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败关键词，验证失败")
-                return True
-            
-            # 检查各种可能的验证失败提示元素
+                logger.info(
+                    f"【{self.pure_user_id}】页面内容包含失败关键词: {found_failure}"
+                )
+
+            # 普通滑块容器和提示文字在验证过程中一直存在，不能作为失败依据。
             failure_selectors = [
                 "text=验证失败，点击框体重试",
                 "text=验证失败",
-                "text=点击框体重试", 
-                "text=重试",
-                ".nc-lang-cnt",
+                "text=点击框体重试",
                 "[class*='retry']",
                 "[class*='fail']",
                 "[class*='error']",
                 ".captcha-tips",
-                "#captcha-loading",
-                ".nc_1_nocaptcha",
-                ".nc_wrapper",
-                ".nc-container"
             ]
-            
+
             retry_button = None
             for selector in failure_selectors:
                 try:
-                    element = self.page.query_selector(selector)
-                    if element and element.is_visible():
-                        # 获取元素文本内容
-                        element_text = ""
-                        try:
-                            element_text = element.text_content()
-                        except:
-                            pass
-                        
-                        logger.info(f"【{self.pure_user_id}】找到验证失败提示: {selector}, 文本: {element_text}")
-                        retry_button = element
-                        break
-                except:
+                    element = scope.query_selector(selector)
+                    if not element or not element.is_visible():
+                        continue
+                    element_text = (element.text_content() or "").strip()
+                    if not any(keyword in element_text for keyword in failure_keywords):
+                        continue
+                    logger.info(
+                        f"【{self.pure_user_id}】找到验证失败提示: "
+                        f"{selector}, 文本: {element_text}"
+                    )
+                    retry_button = element
+                    break
+                except Exception:
                     continue
-            
-            if retry_button:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败提示元素，验证失败")
-                return True, retry_button  # 返回找到的重试按钮元素
+
+            has_failure = bool(found_failure or retry_button)
+            if has_failure:
+                logger.info(f"【{self.pure_user_id}】检测到验证失败提示，验证失败")
             else:
-                logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
-                return False, None
+                logger.info(f"【{self.pure_user_id}】未找到验证失败提示")
+            return has_failure, retry_button
 
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检查验证失败时出错: {e}")
@@ -2319,7 +2303,6 @@ class XianyuSliderStealth:
             fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
         """
         failure_records = []
-        current_strategy = 'ultra_fast'  # 极速策略
         
         for attempt in range(1, max_retries + 1):
             try:
@@ -2367,10 +2350,6 @@ class XianyuSliderStealth:
                 if verification_success:
                     logger.info(f"【{self.pure_user_id}】✅ 滑块验证成功! (第{attempt}次尝试)")
 
-                    # 📊 记录策略成功
-                    strategy_stats.record_attempt(attempt, current_strategy, success=True)
-                    logger.info(f"【{self.pure_user_id}】📊 记录策略: 第{attempt}次-{current_strategy}策略-成功")
-
                     # 保存成功记录用于学习
                     if self.enable_learning and hasattr(self, 'current_trajectory_data'):
                         self._save_success_record(self.current_trajectory_data)
@@ -2380,16 +2359,9 @@ class XianyuSliderStealth:
                     if attempt > 1:
                         logger.info(f"【{self.pure_user_id}】经过{attempt}次尝试后验证成功")
 
-                    # 输出当前统计摘要
-                    strategy_stats.log_summary()
-
                     return True
                 else:
                     logger.warning(f"【{self.pure_user_id}】❌ 第{attempt}次验证失败")
-
-                    # 📊 记录策略失败
-                    strategy_stats.record_attempt(attempt, current_strategy, success=False)
-                    logger.info(f"【{self.pure_user_id}】📊 记录策略: 第{attempt}次-{current_strategy}策略-失败")
 
                     # 分析失败原因
                     if hasattr(self, 'current_trajectory_data'):
@@ -2425,9 +2397,6 @@ class XianyuSliderStealth:
             for record in failure_records:
                 logger.info(f"  - 第{record['attempt']}次: 距离{record['slide_distance']}px, "
                           f"步数{record['total_steps']}, 最终位置{record['final_left_px']}px")
-        
-        # 输出当前统计摘要
-        strategy_stats.log_summary()
         
         return False
     
@@ -3724,6 +3693,13 @@ class XianyuSliderStealth:
                             else:
                                 logger.warning(f"【{self.pure_user_id}】⚠️ notification_callback 未提供，无法发送通知")
                                 logger.warning(f"【{self.pure_user_id}】请确保调用 login_with_password_playwright 时传入 notification_callback 参数")
+
+                            if not show_browser:
+                                logger.error(
+                                    f"【{self.pure_user_id}】无头自动登录需要人工验证，"
+                                    "已结束本次登录，避免阻塞实时连接"
+                                )
+                                return None
                             
                             # 持续等待用户完成二维码/人脸验证
                             logger.info(f"【{self.pure_user_id}】等待二维码/人脸验证完成...")
@@ -3930,6 +3906,15 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】密码登录流程异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            definitive_login_errors = (
+                "账密错误",
+                "账号密码错误",
+                "账号或密码错误",
+                "用户名或密码错误",
+                "账户名或登录密码不正确",
+            )
+            if any(keyword in str(e) for keyword in definitive_login_errors):
+                raise
             return None
     
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
@@ -4379,6 +4364,105 @@ class XianyuSliderStealth:
             return False, None
         finally:
             # 关闭浏览器
+            self.close_browser()
+
+    def run_manual(
+        self,
+        url: str,
+        initial_cookies: Optional[Dict[str, str]] = None,
+        timeout_seconds: int = 180,
+    ):
+        """打开可见浏览器，等待用户手动完成风控验证。"""
+        try:
+            self.headless = False
+            self.init_browser()
+
+            if initial_cookies:
+                browser_cookies = [
+                    {
+                        "name": str(name),
+                        "value": str(value),
+                        "domain": ".goofish.com",
+                        "path": "/",
+                    }
+                    for name, value in initial_cookies.items()
+                    if name and value is not None
+                ]
+                try:
+                    self.context.add_cookies(browser_cookies)
+                    logger.info(
+                        f"【{self.pure_user_id}】人工验证浏览器已载入"
+                        f"{len(browser_cookies)}个账号Cookie"
+                    )
+                except Exception as cookie_error:
+                    logger.warning(
+                        f"【{self.pure_user_id}】人工验证浏览器载入Cookie失败，"
+                        f"继续使用验证链接: {cookie_error}"
+                    )
+
+            logger.warning(
+                f"【{self.pure_user_id}】已打开人工验证窗口，请在"
+                f"{timeout_seconds}秒内手动完成闲鱼风控验证"
+            )
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as load_error:
+                logger.warning(
+                    f"【{self.pure_user_id}】验证页面加载未完全结束，继续等待人工处理: "
+                    f"{load_error}"
+                )
+
+            # 页面初次加载也可能写入x5secdata，先记录挑战页基线，避免误判为验证成功。
+            time.sleep(1)
+            baseline_x5 = {
+                cookie["name"]: cookie["value"]
+                for cookie in self.context.cookies()
+                if cookie.get("name", "").lower().startswith("x5")
+                or "x5sec" in cookie.get("name", "").lower()
+            }
+            deadline = time.time() + max(30, timeout_seconds)
+
+            while time.time() < deadline:
+                if self.page.is_closed():
+                    logger.warning(f"【{self.pure_user_id}】人工验证窗口已被关闭")
+                    return False, None
+
+                current_url = self.page.url or ""
+                current_url_lower = current_url.lower()
+                current_x5 = {
+                    cookie["name"]: cookie["value"]
+                    for cookie in self.context.cookies()
+                    if cookie.get("name", "").lower().startswith("x5")
+                    or "x5sec" in cookie.get("name", "").lower()
+                }
+                x5_updated = any(
+                    baseline_x5.get(name) != value
+                    for name, value in current_x5.items()
+                )
+                left_challenge_page = (
+                    current_url
+                    and "punish" not in current_url_lower
+                    and "captcha" not in current_url_lower
+                    and "x5step" not in current_url_lower
+                )
+
+                if x5_updated or left_challenge_page:
+                    cookies = self._get_cookies_after_success()
+                    if cookies:
+                        logger.info(f"【{self.pure_user_id}】人工风控验证已完成")
+                        return True, cookies
+
+                time.sleep(0.5)
+
+            logger.warning(
+                f"【{self.pure_user_id}】等待人工风控验证超时"
+                f"（{timeout_seconds}秒）"
+            )
+            return False, None
+        except Exception as error:
+            logger.error(f"【{self.pure_user_id}】人工风控验证异常: {error}")
+            return False, None
+        finally:
             self.close_browser()
 
 def get_slider_stats():

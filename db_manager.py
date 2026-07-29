@@ -571,6 +571,33 @@ class DBManager:
             )
             ''')
 
+            # 账号经营数据按天保存。首次采集值作为当天基线，用于计算今日浏览增量。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_shop_metrics (
+                cookie_id TEXT NOT NULL,
+                metric_date TEXT NOT NULL,
+                nickname TEXT DEFAULT '',
+                avatar TEXT DEFAULT '',
+                shop_name TEXT DEFAULT '',
+                is_shop INTEGER DEFAULT 0,
+                followers INTEGER DEFAULT 0,
+                following INTEGER DEFAULT 0,
+                sold_count INTEGER DEFAULT 0,
+                item_count INTEGER DEFAULT 0,
+                first_browse_total INTEGER DEFAULT 0,
+                browse_total INTEGER DEFAULT 0,
+                collect_total INTEGER DEFAULT 0,
+                want_total INTEGER DEFAULT 0,
+                today_exposure INTEGER,
+                exposure_source TEXT DEFAULT '',
+                raw_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, metric_date),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             # 检查并添加 multi_quantity_delivery 列（用于多数量发货功能）
             try:
                 self._execute_sql(cursor, "SELECT multi_quantity_delivery FROM item_info LIMIT 1")
@@ -784,10 +811,44 @@ class DBManager:
                 + ", ".join(missing_tables)
                 + "。请先执行 data/xianyu_mysql.sql"
             )
+        self._ensure_account_shop_metrics_table()
         repaired = self.repair_chat_conversation_names()
         logger.info(f"MySQL 连接成功，检测到 {len(tables)} 张表")
         if repaired:
             logger.info(f"已修复 {repaired} 个被平台通知污染的聊天昵称")
+
+    def _ensure_account_shop_metrics_table(self):
+        """创建账号经营数据表，兼容已迁移但尚未包含该表的 MySQL。"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_shop_metrics (
+                cookie_id VARCHAR(191) NOT NULL,
+                metric_date DATE NOT NULL,
+                nickname VARCHAR(255) DEFAULT '',
+                avatar TEXT,
+                shop_name VARCHAR(255) DEFAULT '',
+                is_shop TINYINT(1) DEFAULT 0,
+                followers BIGINT DEFAULT 0,
+                following BIGINT DEFAULT 0,
+                sold_count BIGINT DEFAULT 0,
+                item_count BIGINT DEFAULT 0,
+                first_browse_total BIGINT DEFAULT 0,
+                browse_total BIGINT DEFAULT 0,
+                collect_total BIGINT DEFAULT 0,
+                want_total BIGINT DEFAULT 0,
+                today_exposure BIGINT NULL,
+                exposure_source VARCHAR(64) DEFAULT '',
+                raw_data LONGTEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, metric_date),
+                CONSTRAINT fk_account_shop_metrics_cookie
+                    FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        self.conn.commit()
 
     def repair_chat_conversation_names(self) -> int:
         """清理平台通知标题，并从历史消息或订单中恢复真实昵称。"""
@@ -4980,6 +5041,158 @@ class DBManager:
         except Exception as e:
             logger.error(f"获取商品多数量发货状态失败: {e}")
             return False
+
+    def save_account_shop_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """保存账号当天经营快照，并返回计算后的今日浏览增量。"""
+        cookie_id = str(metrics.get('cookie_id') or '').strip()
+        metric_date = str(metrics.get('metric_date') or '').strip()
+        if not cookie_id or not metric_date:
+            raise ValueError('cookie_id 和 metric_date 不能为空')
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(
+                cursor,
+                """
+                SELECT first_browse_total
+                FROM account_shop_metrics
+                WHERE cookie_id = ? AND metric_date = ?
+                """,
+                (cookie_id, metric_date),
+            )
+            existing = cursor.fetchone()
+            browse_total = max(0, int(metrics.get('browse_total') or 0))
+            first_browse_total = max(0, int(existing[0] or 0)) if existing else browse_total
+
+            values = (
+                cookie_id,
+                metric_date,
+                str(metrics.get('nickname') or ''),
+                str(metrics.get('avatar') or ''),
+                str(metrics.get('shop_name') or ''),
+                int(bool(metrics.get('is_shop'))),
+                max(0, int(metrics.get('followers') or 0)),
+                max(0, int(metrics.get('following') or 0)),
+                max(0, int(metrics.get('sold_count') or 0)),
+                max(0, int(metrics.get('item_count') or 0)),
+                first_browse_total,
+                browse_total,
+                max(0, int(metrics.get('collect_total') or 0)),
+                max(0, int(metrics.get('want_total') or 0)),
+                metrics.get('today_exposure'),
+                str(metrics.get('exposure_source') or ''),
+                json.dumps(metrics.get('raw_data') or {}, ensure_ascii=False),
+            )
+
+            if self.db_type == 'mysql':
+                sql = """
+                    INSERT INTO account_shop_metrics (
+                        cookie_id, metric_date, nickname, avatar, shop_name,
+                        is_shop, followers, following, sold_count, item_count,
+                        first_browse_total, browse_total, collect_total, want_total,
+                        today_exposure, exposure_source, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON DUPLICATE KEY UPDATE
+                        nickname = VALUES(nickname),
+                        avatar = VALUES(avatar),
+                        shop_name = VALUES(shop_name),
+                        is_shop = VALUES(is_shop),
+                        followers = VALUES(followers),
+                        following = VALUES(following),
+                        sold_count = VALUES(sold_count),
+                        item_count = VALUES(item_count),
+                        browse_total = VALUES(browse_total),
+                        collect_total = VALUES(collect_total),
+                        want_total = VALUES(want_total),
+                        today_exposure = VALUES(today_exposure),
+                        exposure_source = VALUES(exposure_source),
+                        raw_data = VALUES(raw_data),
+                        updated_at = CURRENT_TIMESTAMP
+                """
+            else:
+                sql = """
+                    INSERT INTO account_shop_metrics (
+                        cookie_id, metric_date, nickname, avatar, shop_name,
+                        is_shop, followers, following, sold_count, item_count,
+                        first_browse_total, browse_total, collect_total, want_total,
+                        today_exposure, exposure_source, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cookie_id, metric_date) DO UPDATE SET
+                        nickname = excluded.nickname,
+                        avatar = excluded.avatar,
+                        shop_name = excluded.shop_name,
+                        is_shop = excluded.is_shop,
+                        followers = excluded.followers,
+                        following = excluded.following,
+                        sold_count = excluded.sold_count,
+                        item_count = excluded.item_count,
+                        browse_total = excluded.browse_total,
+                        collect_total = excluded.collect_total,
+                        want_total = excluded.want_total,
+                        today_exposure = excluded.today_exposure,
+                        exposure_source = excluded.exposure_source,
+                        raw_data = excluded.raw_data,
+                        updated_at = CURRENT_TIMESTAMP
+                """
+            self._execute_sql(cursor, sql, values)
+            self.conn.commit()
+
+        result = dict(metrics)
+        result['first_browse_total'] = first_browse_total
+        result['today_browse'] = max(0, browse_total - first_browse_total)
+        return result
+
+    def get_account_shop_metrics(self, user_id: int, metric_date: str) -> List[Dict[str, Any]]:
+        """读取当前用户在指定日期的账号经营数据。"""
+        columns = [
+            'cookie_id', 'metric_date', 'nickname', 'avatar', 'shop_name',
+            'is_shop', 'followers', 'following', 'sold_count', 'item_count',
+            'first_browse_total', 'browse_total', 'collect_total', 'want_total',
+            'today_exposure', 'exposure_source', 'raw_data', 'updated_at',
+        ]
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(
+                cursor,
+                """
+                SELECT
+                    m.cookie_id, m.metric_date, m.nickname, m.avatar, m.shop_name,
+                    m.is_shop, m.followers, m.following, m.sold_count, m.item_count,
+                    m.first_browse_total, m.browse_total, m.collect_total, m.want_total,
+                    m.today_exposure, m.exposure_source, m.raw_data, m.updated_at
+                FROM account_shop_metrics m
+                INNER JOIN cookies c ON c.id = m.cookie_id
+                WHERE c.user_id = ? AND m.metric_date = ?
+                ORDER BY m.updated_at DESC
+                """,
+                (user_id, metric_date),
+            )
+            rows = []
+            for row in cursor.fetchall():
+                item = dict(zip(columns, row))
+                item['metric_date'] = str(item.get('metric_date') or '')
+                item['updated_at'] = str(item.get('updated_at') or '')
+                item['is_shop'] = bool(item.get('is_shop'))
+                raw_data = item.pop('raw_data', None)
+                if isinstance(raw_data, str):
+                    try:
+                        raw_data = json.loads(raw_data)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        raw_data = {}
+                if not isinstance(raw_data, dict):
+                    raw_data = {}
+                item['shop_data'] = raw_data.get('shop_data') or {
+                    'source': 'official_data_center',
+                    'supported_days': [1, 7, 15, 30],
+                    'periods': {},
+                }
+                item['today_browse'] = max(
+                    0,
+                    int(item.get('browse_total') or 0)
+                    - int(item.get('first_browse_total') or 0),
+                )
+                rows.append(item)
+            return rows
 
     def get_items_by_cookie(self, cookie_id: str) -> List[Dict]:
         """获取指定Cookie的所有商品信息
