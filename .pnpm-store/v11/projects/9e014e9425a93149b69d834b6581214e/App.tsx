@@ -10,6 +10,7 @@ import Settings from './components/Settings';
 import Keywords from './components/Keywords';
 import ChatManager from './components/ChatManager';
 import { login, verifyToken } from './services/api';
+import { useNotificationSound } from './hooks/useNotificationSound';
 import { ShieldCheck, ArrowRight, Loader2, Sparkles, User, Lock, KeyRound } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -20,6 +21,7 @@ const App: React.FC = () => {
   const [password, setPassword] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState('');
+  useNotificationSound(isLoggedIn);
 
   // Check auth on mount
   useEffect(() => {
