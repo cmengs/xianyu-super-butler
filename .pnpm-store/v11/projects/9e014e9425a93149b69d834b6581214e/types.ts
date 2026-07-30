@@ -35,6 +35,29 @@ export interface AccountDetail {
   connection_state?: string;
   connection_reason?: string;
   login_required?: boolean;
+  runtime_online?: boolean;
+  ws_connected?: boolean;
+  heartbeat_ok?: boolean;
+  heartbeat_status?: string;
+  heartbeat_age_seconds?: number | null;
+  token_ready?: boolean;
+  token_age_seconds?: number | null;
+  last_token_refresh_status?: string;
+  last_token_refresh_error?: string;
+  token_issue?: boolean;
+  last_risk_control_status?: string | null;
+  last_risk_control_message?: string;
+  last_risk_control_at?: string | null;
+  last_message_received_at?: number | null;
+  last_message_received_seconds?: number | null;
+  last_send_status?: string;
+  last_send_error?: string;
+  last_send_code?: number | null;
+  last_send_at?: number | null;
+  send_channel_ok?: boolean | null;
+  online_check_status?: string;
+  online_check_message?: string;
+  online_checked_at?: number;
   auto_confirm: boolean;
   remark?: string;
   note?: string; // alias for remark
@@ -43,6 +66,7 @@ export interface AccountDetail {
   username?: string;
   login_password?: string;
   show_browser?: boolean;
+  device_id?: string;
   // Frontend helpers
   nickname?: string;
   avatar_url?: string;

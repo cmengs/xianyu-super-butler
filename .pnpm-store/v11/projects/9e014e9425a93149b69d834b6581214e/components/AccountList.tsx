@@ -14,12 +14,14 @@ import {
   updateAccountLoginInfo,
   updateAccountAISettings,
   getAllAISettings,
-  getAccountAISettings
+  getAccountAISettings,
+  checkAccountOnlineStatus
 } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Upload, Key, Eye, EyeOff, Bot, Settings
+  Upload, Key, Eye, EyeOff, Bot, Settings, Activity, Wifi,
+  SendHorizontal, AlertTriangle, Fingerprint
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -34,6 +36,7 @@ const AccountList: React.FC = () => {
   const [qrTargetAccount, setQrTargetAccount] = useState<AccountDetail | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
+  const [checkingAccountId, setCheckingAccountId] = useState<string | null>(null);
 
   // 编辑表单状态
   const [editForm, setEditForm] = useState({
@@ -44,6 +47,7 @@ const AccountList: React.FC = () => {
     username: '',
     login_password: '',
     show_browser: false,
+    device_id: '',
     showLoginPassword: false,
   });
 
@@ -116,6 +120,127 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const handleCheckOnline = async (account: AccountDetail) => {
+    setCheckingAccountId(account.id);
+    try {
+      const checked = await checkAccountOnlineStatus(account.id);
+      setAccounts(current => current.map(item => {
+        if (item.id !== account.id) return item;
+        return {
+          ...item,
+          ...checked,
+          value: checked.value ?? item.value,
+          cookie: checked.cookie ?? item.cookie,
+          auto_confirm: item.auto_confirm,
+          ai_enabled: item.ai_enabled,
+          max_discount_percent: item.max_discount_percent,
+          max_discount_amount: item.max_discount_amount,
+          max_bargain_rounds: item.max_bargain_rounds,
+          custom_prompts: item.custom_prompts,
+        };
+      }));
+    } catch (error) {
+      alert(error instanceof Error ? error.message : '在线状态检测失败');
+    } finally {
+      setCheckingAccountId(null);
+    }
+  };
+
+  const renderConnectionBadge = (account: AccountDetail) => {
+    if (!account.enabled) {
+      return <span className="px-2.5 py-0.5 rounded-lg bg-gray-100 text-gray-500 text-xs font-bold">暂停</span>;
+    }
+    if (account.online_check_status === 'send_blocked') {
+      return (
+        <span
+          className="px-2.5 py-0.5 rounded-lg bg-amber-100 text-amber-700 text-xs font-bold"
+          title={account.online_check_message || account.last_send_error || '心跳在线，但发信被闲鱼拒绝'}
+        >
+          在线/发信异常
+        </span>
+      );
+    }
+    if (account.online_check_status === 'needs_verification' || account.connection_state === 'verifying') {
+      return (
+        <span
+          className="px-2.5 py-0.5 rounded-lg bg-amber-100 text-amber-700 text-xs font-bold"
+          title={account.online_check_message || account.connection_reason || '请在弹出的浏览器中完成验证'}
+        >
+          需验证
+        </span>
+      );
+    }
+    if (account.connected) {
+      return (
+        <span
+          className="px-2.5 py-0.5 rounded-lg bg-green-100 text-green-700 text-xs font-bold"
+          title={account.online_check_message || 'WS 心跳在线'}
+        >
+          在线
+        </span>
+      );
+    }
+    if (account.connection_state === 'connecting' || account.connection_state === 'reconnecting') {
+      return <span className="px-2.5 py-0.5 rounded-lg bg-blue-100 text-blue-700 text-xs font-bold">连接中</span>;
+    }
+    return (
+      <span
+        className="px-2.5 py-0.5 rounded-lg bg-red-50 text-red-600 text-xs font-bold"
+        title={account.online_check_message || account.connection_reason || '账号连接已停止'}
+      >
+        需重登
+      </span>
+    );
+  };
+
+  const renderRuntimeBadges = (account: AccountDetail) => {
+    const sendFailed = account.last_send_status === 'failed' || account.last_send_status === 'timeout';
+    const tokenIssueStatuses = ['failed', 'exception', 'needs_verification', 'captcha_failed', 'captcha_exception', 'captcha_max_retries'];
+    const tokenIssue = Boolean(account.token_issue || tokenIssueStatuses.includes(account.last_token_refresh_status || ''));
+    const tokenText = tokenIssue
+      ? 'Token/风控异常'
+      : account.token_ready
+        ? 'WS Token可用'
+        : 'WS Token待刷新';
+    const heartbeatText = account.heartbeat_status === 'ok'
+      ? `心跳${account.heartbeat_age_seconds ?? 0}s`
+      : account.heartbeat_status === 'waiting'
+        ? '心跳等待'
+        : account.ws_connected
+          ? '心跳异常'
+          : 'WS离线';
+
+    return (
+      <>
+        <span className={`text-xs px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 ${
+          account.heartbeat_ok ? 'bg-green-50 text-green-700' : 'bg-gray-100 text-gray-500'
+        }`}>
+          <Wifi className="w-3 h-3" /> {heartbeatText}
+        </span>
+        <span className={`text-xs px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 ${
+          tokenIssue ? 'bg-amber-50 text-amber-700' : account.token_ready ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+        }`}
+          title={account.last_token_refresh_error || account.last_risk_control_message || account.last_token_refresh_status || ''}
+        >
+          {tokenIssue ? <AlertTriangle className="w-3 h-3" /> : <Key className="w-3 h-3" />} {tokenText}
+        </span>
+        {sendFailed && (
+          <span
+            className="text-xs bg-red-50 text-red-600 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"
+            title={account.last_send_error || account.online_check_message || '最近一次发信失败'}
+          >
+            <SendHorizontal className="w-3 h-3" /> 发信异常{account.last_send_code ? ` ${account.last_send_code}` : ''}
+          </span>
+        )}
+        {account.last_send_status === 'ok' && (
+          <span className="text-xs bg-green-50 text-green-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5">
+            <SendHorizontal className="w-3 h-3" /> 发信正常
+          </span>
+        )}
+      </>
+    );
+  };
+
   const openEditModal = (account: AccountDetail) => {
     setEditingAccount(account);
     setEditForm({
@@ -126,6 +251,7 @@ const AccountList: React.FC = () => {
       username: account.username || '',
       login_password: account.login_password || '',
       show_browser: account.show_browser || false,
+      device_id: account.device_id || '',
       showLoginPassword: false,
     });
     setActiveModal('edit');
@@ -182,12 +308,14 @@ const AccountList: React.FC = () => {
       if (
         editForm.username !== (editingAccount.username || '') ||
         editForm.login_password !== (editingAccount.login_password || '') ||
-        editForm.show_browser !== (editingAccount.show_browser || false)
+        editForm.show_browser !== (editingAccount.show_browser || false) ||
+        editForm.device_id !== (editingAccount.device_id || '')
       ) {
         promises.push(updateAccountLoginInfo(editingAccount.id, {
           username: editForm.username,
           login_password: editForm.login_password,
           show_browser: editForm.show_browser,
+          device_id: editForm.device_id,
         }));
       }
 
@@ -299,35 +427,17 @@ const AccountList: React.FC = () => {
                   className="w-20 h-20 rounded-3xl object-cover shadow-md ring-4 ring-white"
                 />
                 <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${
-                  account.connected ? 'bg-green-500' : account.enabled ? 'bg-red-400' : 'bg-gray-300'
+                  account.online_check_status === 'send_blocked' ? 'bg-amber-500' : account.connected ? 'bg-green-500' : account.enabled ? 'bg-red-400' : 'bg-gray-300'
                 }`}>
-                    {account.connected && <Check className="w-3 h-3 text-white" />}
+                    {account.online_check_status === 'send_blocked' ? (
+                      <AlertTriangle className="w-3 h-3 text-white" />
+                    ) : account.connected && <Check className="w-3 h-3 text-white" />}
                 </div>
               </div>
               <div>
                 <div className="flex items-center gap-3 mb-1">
                     <h3 className="text-xl font-extrabold text-gray-900">{account.nickname || account.remark || `账号 ${account.id.substring(0,6)}...`}</h3>
-                    {!account.enabled ? (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-gray-100 text-gray-500 text-xs font-bold">暂停</span>
-                    ) : account.connected ? (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-green-100 text-green-700 text-xs font-bold">在线</span>
-                    ) : account.connection_state === 'verifying' ? (
-                        <span
-                          className="px-2.5 py-0.5 rounded-lg bg-amber-100 text-amber-700 text-xs font-bold"
-                          title={account.connection_reason || '请在弹出的浏览器中完成验证'}
-                        >
-                          验证中
-                        </span>
-                    ) : account.connection_state === 'connecting' || account.connection_state === 'reconnecting' ? (
-                        <span className="px-2.5 py-0.5 rounded-lg bg-blue-100 text-blue-700 text-xs font-bold">连接中</span>
-                    ) : (
-                        <span
-                          className="px-2.5 py-0.5 rounded-lg bg-red-50 text-red-600 text-xs font-bold"
-                          title={account.connection_reason || '账号连接已停止'}
-                        >
-                          {account.connection_reason?.includes('验证') || account.connection_reason?.includes('风控') ? '需验证' : '需重登'}
-                        </span>
-                    )}
+                    {renderConnectionBadge(account)}
                     {account.ai_enabled && (
                         <span className="px-2.5 py-0.5 rounded-lg bg-purple-100 text-purple-700 text-xs font-bold flex items-center gap-1">
                           <Bot className="w-3 h-3" /> AI
@@ -335,7 +445,16 @@ const AccountList: React.FC = () => {
                     )}
                 </div>
                 <p className="text-sm text-gray-500 font-medium mb-3">{account.remark || account.note || '暂无备注'}</p>
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
+                   {renderRuntimeBadges(account)}
+                   {account.device_id && (
+                     <span
+                       className="text-xs bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"
+                       title={account.device_id}
+                     >
+                       <Fingerprint className="w-3 h-3" /> 设备 {account.device_id.slice(0, 8)}...
+                     </span>
+                   )}
                    {account.auto_confirm && <span className="text-xs bg-yellow-50 text-yellow-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动回复</span>}
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
                 </div>
@@ -349,6 +468,15 @@ const AccountList: React.FC = () => {
                 >
                     <QrCode className="w-4 h-4" />
                     扫码重登
+                </button>
+                <button
+                    onClick={() => handleCheckOnline(account)}
+                    disabled={checkingAccountId === account.id}
+                    className="px-3 py-2.5 rounded-xl hover:bg-green-50 transition-colors text-green-700 font-bold text-sm flex items-center gap-2 disabled:opacity-60"
+                    title={account.online_check_message || '检测该闲鱼账号当前在线状态'}
+                >
+                    {checkingAccountId === account.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                    检测在线
                 </button>
                 <button
                     onClick={() => openEditModal(account)}
@@ -466,6 +594,20 @@ const AccountList: React.FC = () => {
                   value={editingAccount.id}
                   disabled
                   className="w-full ios-input px-4 py-3 rounded-xl bg-gray-50 text-gray-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-bold text-gray-700 mb-2 flex items-center gap-2">
+                  <Fingerprint className="w-4 h-4 text-slate-500" />
+                  设备ID
+                </label>
+                <input
+                  type="text"
+                  value={editForm.device_id}
+                  onChange={(e) => setEditForm({ ...editForm, device_id: e.target.value.trim() })}
+                  placeholder="设备ID"
+                  className="w-full ios-input px-4 py-3 rounded-xl font-mono text-xs"
                 />
               </div>
 

@@ -18,7 +18,7 @@ import pandas as pd
 import io
 import asyncio
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 
 import cookie_manager
 from db_manager import db_manager
@@ -64,6 +64,50 @@ async def _await_cookie_manager_action(action):
     if asyncio.isfuture(action) or asyncio.iscoroutine(action):
         return await action
     return action
+
+
+async def _activate_login_cookie(
+    account_id: str,
+    cookie_value: str,
+    user_id: int,
+    is_new_account: bool,
+    current_user: Dict[str, Any],
+    source: str,
+):
+    """Restart an account after a fresh login cookie and invalidate old message tokens."""
+    try:
+        db_manager.delete_account_ws_token(account_id)
+        log_with_user('info', f"{source}: 已清理旧消息 Token 缓存: {account_id}", current_user)
+    except Exception as token_error:
+        log_with_user('warning', f"{source}: 清理旧消息 Token 缓存失败: {account_id} - {token_error}", current_user)
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+        XianyuLive._recent_qr_login_times[str(account_id)] = time.time()
+    except Exception as mark_error:
+        log_with_user('debug', f"{source}: 标记扫码更新时间失败: {account_id} - {mark_error}", current_user)
+
+    if not cookie_manager.manager:
+        return None
+
+    if is_new_account:
+        action = cookie_manager.manager.add_cookie(
+            account_id,
+            cookie_value,
+            user_id=user_id,
+        )
+        await _await_cookie_manager_action(action)
+        log_with_user('info', f"{source}: 已将登录 cookie 添加到 cookie_manager: {account_id}", current_user)
+    else:
+        action = cookie_manager.manager.update_cookie(
+            account_id,
+            cookie_value,
+            save_to_db=False,
+        )
+        await _await_cookie_manager_action(action)
+        log_with_user('info', f"{source}: 已用登录 cookie 重启账号任务: {account_id}", current_user)
+
+    return True
 
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
@@ -1340,6 +1384,201 @@ class SystemSettingCreateIn(BaseModel):
 
 
 
+def _get_account_runtime_status(cookie_id: str) -> Dict[str, Any]:
+    """汇总账号实时连接状态，避免把 WS 心跳在线误判为发信可用。"""
+    now = time.time()
+    status: Dict[str, Any] = {
+        "connection_state": "offline",
+        "connection_reason": "",
+        "connected": False,
+        "runtime_online": False,
+        "ws_connected": False,
+        "heartbeat_ok": False,
+        "heartbeat_status": "offline",
+        "heartbeat_age_seconds": None,
+        "token_ready": False,
+        "token_age_seconds": None,
+        "last_token_refresh_status": None,
+        "last_token_refresh_error": "",
+        "token_issue": False,
+        "last_message_received_at": None,
+        "last_message_received_seconds": None,
+        "last_send_status": "unknown",
+        "last_send_error": "",
+        "last_send_code": None,
+        "last_send_at": None,
+        "last_send_mid": "",
+        "send_channel_ok": None,
+        "online_check_status": "offline",
+        "online_check_message": "实时实例未连接",
+        "online_checked_at": int(now),
+        "last_risk_control_status": None,
+        "last_risk_control_message": "",
+        "last_risk_control_at": None,
+        "reconnect_blocked": False,
+        "reconnect_block_reason": "",
+        "connection_failures": 0,
+        "device_id": "",
+    }
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if live_instance:
+            if hasattr(live_instance, "get_runtime_status"):
+                status.update(live_instance.get_runtime_status())
+            else:
+                state = getattr(live_instance, "connection_state", None)
+                status.update({
+                    "connection_state": getattr(state, "value", str(state or "connecting")),
+                    "connection_reason": getattr(live_instance, "connection_reason", "") or "",
+                    "ws_connected": bool(getattr(live_instance, "ws", None) and not live_instance.ws.closed),
+                })
+        else:
+            cached_status = XianyuLive.get_cached_connection_status(cookie_id)
+            if cached_status:
+                status["connection_state"] = cached_status.get("state", status["connection_state"])
+                status["connection_reason"] = cached_status.get("reason", "") or ""
+    except Exception as state_error:
+        logger.debug(f"获取账号 {cookie_id} 实时连接状态失败: {state_error}")
+        status["connection_reason"] = f"状态检测异常: {state_error}"
+
+    try:
+        risk_logs = db_manager.get_risk_control_logs(cookie_id=cookie_id, limit=1)
+        if risk_logs:
+            latest_risk = risk_logs[0]
+            risk_status = latest_risk.get("processing_status")
+            risk_message = (
+                latest_risk.get("processing_result")
+                or latest_risk.get("error_message")
+                or latest_risk.get("event_description")
+                or ""
+            )
+            risk_created_at = latest_risk.get("created_at")
+            status["last_risk_control_status"] = risk_status
+            status["last_risk_control_message"] = risk_message
+            status["last_risk_control_at"] = risk_created_at
+
+            risk_recent = True
+            parsed_risk_time = None
+            if isinstance(risk_created_at, str) and risk_created_at.strip():
+                for time_format in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                    try:
+                        parsed_risk_time = datetime.strptime(risk_created_at, time_format)
+                        break
+                    except ValueError:
+                        continue
+                if parsed_risk_time:
+                    risk_recent = abs((datetime.now() - parsed_risk_time).total_seconds()) <= 86400
+            elif isinstance(risk_created_at, datetime):
+                parsed_risk_time = risk_created_at
+                risk_recent = abs((datetime.now() - parsed_risk_time).total_seconds()) <= 86400
+
+            risk_after_latest_login = True
+            last_qr_cookie_refresh_at = status.get("last_qr_cookie_refresh_at")
+            if parsed_risk_time and isinstance(last_qr_cookie_refresh_at, (int, float)):
+                risk_after_latest_login = parsed_risk_time.timestamp() > float(last_qr_cookie_refresh_at)
+
+            current_refresh_status = str(status.get("last_token_refresh_status") or "")
+            if (
+                risk_recent
+                and risk_after_latest_login
+                and risk_status in ("processing", "failed")
+                and current_refresh_status != "success"
+            ):
+                if not status.get("last_token_refresh_error"):
+                    status["last_token_refresh_error"] = risk_message or "最近风控验证未完成"
+                if current_refresh_status in ("", "cached", "not_started", "started"):
+                    status["last_token_refresh_status"] = (
+                        "needs_verification" if risk_status == "processing" else "captcha_failed"
+                    )
+    except Exception as risk_error:
+        logger.debug(f"获取账号 {cookie_id} 风控日志失败: {risk_error}")
+
+    heartbeat_age = status.get("heartbeat_age_seconds")
+    ws_connected = bool(status.get("ws_connected"))
+    heartbeat_threshold = 90
+    if ws_connected and heartbeat_age is None:
+        status["heartbeat_status"] = "waiting"
+        status["heartbeat_ok"] = True
+    elif ws_connected and isinstance(heartbeat_age, int) and heartbeat_age <= heartbeat_threshold:
+        status["heartbeat_status"] = "ok"
+        status["heartbeat_ok"] = True
+    elif ws_connected:
+        status["heartbeat_status"] = "stale"
+        status["heartbeat_ok"] = False
+    else:
+        status["heartbeat_status"] = "offline"
+        status["heartbeat_ok"] = False
+
+    connection_state = str(status.get("connection_state") or "offline")
+    reason = str(status.get("connection_reason") or status.get("reconnect_block_reason") or "")
+    reason_has_verification = any(keyword in reason for keyword in ("验证", "风控", "滑块", "captcha"))
+    runtime_online = connection_state == "connected" and ws_connected and bool(status.get("heartbeat_ok"))
+    status["runtime_online"] = runtime_online
+    status["connected"] = runtime_online
+
+    last_send_status = str(status.get("last_send_status") or "unknown")
+    last_send_at = status.get("last_send_at")
+    recent_send_failed = (
+        last_send_status in ("failed", "timeout")
+        and isinstance(last_send_at, (int, float))
+        and now - float(last_send_at) <= 3600
+    )
+
+    if last_send_status == "ok":
+        status["send_channel_ok"] = True
+    elif recent_send_failed:
+        status["send_channel_ok"] = False
+
+    token_refresh_status = str(status.get("last_token_refresh_status") or "")
+    token_refresh_error = str(status.get("last_token_refresh_error") or "")
+    token_issue_statuses = {
+        "failed",
+        "exception",
+        "needs_verification",
+        "captcha_failed",
+        "captcha_exception",
+        "captcha_max_retries",
+    }
+    token_needs_verification = token_refresh_status in {
+        "needs_verification",
+        "captcha_failed",
+        "captcha_exception",
+        "captcha_max_retries",
+    } or any(keyword in token_refresh_error for keyword in ("验证", "风控", "滑块", "captcha"))
+    token_issue = token_refresh_status in token_issue_statuses
+    status["token_issue"] = token_issue
+
+    if connection_state == "verifying" or status.get("reconnect_blocked") or token_needs_verification or (
+        connection_state == "failed" and reason_has_verification
+    ):
+        status["online_check_status"] = "needs_verification"
+        status["online_check_message"] = (
+            token_refresh_error
+            or status.get("last_risk_control_message")
+            or reason
+            or "闲鱼要求完成风控验证"
+        )
+    elif runtime_online and recent_send_failed:
+        status["online_check_status"] = "send_blocked"
+        code = status.get("last_send_code")
+        error = status.get("last_send_error") or "闲鱼拒绝发送消息"
+        status["online_check_message"] = f"心跳在线，但发信被闲鱼拒绝{f'（code={code}）' if code else ''}: {error}"
+    elif runtime_online:
+        status["online_check_status"] = "online"
+        status["online_check_message"] = "WS 心跳在线"
+    elif connection_state in ("connecting", "reconnecting"):
+        status["online_check_status"] = "connecting"
+        status["online_check_message"] = reason or "账号正在连接或重连"
+    else:
+        status["online_check_status"] = "offline"
+        status["online_check_message"] = reason or "实时实例未连接"
+
+    return status
+
+
 @app.get("/cookies")
 def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
@@ -1370,38 +1609,58 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
-        connection_state = 'offline'
-        connection_reason = ''
-        connected = False
-        try:
-            from XianyuAutoAsync import XianyuLive
-            live_instance = XianyuLive.get_instance(cookie_id)
-            if live_instance:
-                state = getattr(live_instance, 'connection_state', None)
-                connection_state = getattr(state, 'value', str(state or 'connecting'))
-                connection_reason = getattr(live_instance, 'connection_reason', '')
-                connected = connection_state == 'connected'
-            else:
-                cached_status = XianyuLive.get_cached_connection_status(cookie_id)
-                if cached_status:
-                    connection_state = cached_status.get('state', connection_state)
-                    connection_reason = cached_status.get('reason', '')
-        except Exception as state_error:
-            logger.debug(f"获取账号 {cookie_id} 实时连接状态失败: {state_error}")
+        runtime_status = _get_account_runtime_status(cookie_id)
+        device_id = (
+            cookie_details.get('device_id')
+            if cookie_details and cookie_details.get('device_id')
+            else runtime_status.get('device_id', '')
+        )
 
         result.append({
             'id': cookie_id,
             'value': cookie_value,
             'enabled': cookie_enabled,
-            'connected': connected,
-            'connection_state': connection_state,
-            'connection_reason': connection_reason,
-            'login_required': bool(cookie_enabled and connection_state in ('offline', 'failed', 'closed')),
+            **runtime_status,
+            'device_id': device_id,
+            'login_required': bool(
+                cookie_enabled
+                and runtime_status.get('online_check_status') in ('offline', 'needs_verification')
+            ),
             'auto_confirm': auto_confirm,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
         })
     return result
+
+
+@app.post("/cookies/{cid}/online-check")
+def check_cookie_online_status(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动检测账号当前实时连接/发信通道状态。"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权检测该账号")
+
+    cookie_details = db_manager.get_cookie_details(cid)
+    runtime_status = _get_account_runtime_status(cid)
+    device_id = (
+        cookie_details.get('device_id')
+        if cookie_details and cookie_details.get('device_id')
+        else runtime_status.get('device_id', '')
+    )
+    result = {
+        'id': cid,
+        'enabled': cookie_manager.manager.get_cookie_status(cid),
+        **runtime_status,
+        'device_id': device_id,
+        'login_required': bool(
+            runtime_status.get('online_check_status') in ('offline', 'needs_verification')
+        ),
+        'remark': cookie_details.get('remark', '') if cookie_details else '',
+        'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+    }
+    return {"success": True, "data": result, **result}
 
 
 @app.post("/cookies")
@@ -1444,6 +1703,20 @@ class AccountLoginInfoUpdate(BaseModel):
     username: Optional[str] = None
     login_password: Optional[str] = None
     show_browser: Optional[bool] = None
+    device_id: Optional[str] = None
+
+
+def _normalize_account_device_id(device_id: Optional[str]) -> Optional[str]:
+    if device_id is None:
+        return None
+    normalized = str(device_id).strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="device_id 不能为空")
+    if len(normalized) > 191:
+        raise HTTPException(status_code=400, detail="device_id 不能超过 191 个字符")
+    if any(char.isspace() for char in normalized):
+        raise HTTPException(status_code=400, detail="device_id 不能包含空白字符")
+    return normalized
 
 
 @app.put("/cookies/{cid}/login-info")
@@ -1458,15 +1731,25 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
+        old_cookie_details = db_manager.get_cookie_details(cid)
+        old_device_id = old_cookie_details.get('device_id', '') if old_cookie_details else ''
+        new_device_id = _normalize_account_device_id(update_data.device_id)
+
         # 使用现有的update_cookie_account_info方法更新登录信息
         success = db_manager.update_cookie_account_info(
             cid,
             username=update_data.username,
             password=update_data.login_password,
-            show_browser=update_data.show_browser
+            show_browser=update_data.show_browser,
+            device_id=new_device_id
         )
 
         if success:
+            if new_device_id is not None and new_device_id != old_device_id:
+                db_manager.delete_account_ws_token(cid)
+                cookie_value = old_cookie_details.get('value') if old_cookie_details else user_cookies.get(cid)
+                if cookie_value and cookie_manager.manager:
+                    cookie_manager.manager.update_cookie(cid, cookie_value, save_to_db=False)
             return {"success": True, "message": "登录信息已更新"}
         else:
             raise HTTPException(status_code=500, detail="更新登录信息失败")
@@ -1521,6 +1804,7 @@ class CookieAccountInfo(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     show_browser: Optional[bool] = None
+    device_id: Optional[str] = None
 
 
 @app.post("/cookie/{cid}/account-info")
@@ -1540,6 +1824,8 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
         # 获取旧的 cookie 值，用于判断是否需要重启任务
         old_cookie_details = db_manager.get_cookie_details(cid)
         old_cookie_value = old_cookie_details.get('value') if old_cookie_details else None
+        old_device_id = old_cookie_details.get('device_id', '') if old_cookie_details else ''
+        new_device_id = _normalize_account_device_id(info.device_id)
         
         # 更新数据库
         success = db_manager.update_cookie_account_info(
@@ -1547,16 +1833,21 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
             cookie_value=info.value,
             username=info.username,
             password=info.password,
-            show_browser=info.show_browser
+            show_browser=info.show_browser,
+            device_id=new_device_id
         )
         
         if not success:
             raise HTTPException(status_code=400, detail="更新账号信息失败")
         
         # 只有当 cookie 值真的发生变化时才重启任务
-        if info.value is not None and info.value != old_cookie_value:
+        device_changed = new_device_id is not None and new_device_id != old_device_id
+        if device_changed:
+            db_manager.delete_account_ws_token(cid)
+
+        if (info.value is not None and info.value != old_cookie_value) or device_changed:
             logger.info(f"Cookie值已变化，重启任务: {cid}")
-            cookie_manager.manager.update_cookie(cid, info.value, save_to_db=False)
+            cookie_manager.manager.update_cookie(cid, info.value or old_cookie_value, save_to_db=False)
         else:
             logger.info(f"Cookie值未变化，无需重启任务: {cid}")
         
@@ -2383,25 +2674,14 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
-                    # 第二步：将真实cookie添加到cookie_manager（如果是新账号）或更新现有账号
-                    if cookie_manager.manager:
-                        if is_new_account:
-                            action = cookie_manager.manager.add_cookie(
-                                account_id,
-                                real_cookies,
-                                user_id=user_id,
-                            )
-                            await _await_cookie_manager_action(action)
-                            log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
-                        else:
-                            # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                            action = cookie_manager.manager.update_cookie(
-                                account_id,
-                                real_cookies,
-                                save_to_db=False,
-                            )
-                            await _await_cookie_manager_action(action)
-                            log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                    await _activate_login_cookie(
+                        account_id=account_id,
+                        cookie_value=real_cookies,
+                        user_id=user_id,
+                        is_new_account=is_new_account,
+                        current_user=current_user,
+                        source="扫码登录",
+                    )
 
                     return {
                         'account_id': account_id,
@@ -2445,25 +2725,14 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
             db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
             log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
 
-        # 添加到或更新cookie_manager
-        if cookie_manager.manager:
-            if is_new_account:
-                action = cookie_manager.manager.add_cookie(
-                    account_id,
-                    cookies,
-                    user_id=user_id,
-                )
-                await _await_cookie_manager_action(action)
-                log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
-            else:
-                # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                action = cookie_manager.manager.update_cookie(
-                    account_id,
-                    cookies,
-                    save_to_db=False,
-                )
-                await _await_cookie_manager_action(action)
-                log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
+        await _activate_login_cookie(
+            account_id=account_id,
+            cookie_value=cookies,
+            user_id=user_id,
+            is_new_account=is_new_account,
+            current_user=current_user,
+            source="扫码登录降级处理",
+        )
 
         return {
             'account_id': account_id,
@@ -2520,19 +2789,16 @@ async def refresh_cookies_from_qr_login(
         if success:
             log_with_user('info', f"扫码cookie刷新成功: {cookie_id}", current_user)
 
-            # 如果cookie_manager存在，更新其中的cookie
-            if cookie_manager.manager:
-                # 从数据库获取更新后的cookie
-                updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
-                if updated_cookie_info:
-                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                    action = cookie_manager.manager.update_cookie(
-                        cookie_id,
-                        updated_cookie_info['cookies_str'],
-                        save_to_db=False,
-                    )
-                    await _await_cookie_manager_action(action)
-                    log_with_user('info', f"已更新cookie_manager中的cookie: {cookie_id}", current_user)
+            updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
+            if updated_cookie_info:
+                await _activate_login_cookie(
+                    account_id=cookie_id,
+                    cookie_value=updated_cookie_info['cookies_str'],
+                    user_id=current_user['user_id'],
+                    is_new_account=False,
+                    current_user=current_user,
+                    source="扫码cookie刷新",
+                )
 
             return {
                 'success': True,
@@ -6387,6 +6653,9 @@ async def send_user_chat_message(
         }
     except HTTPException:
         raise
+    except RuntimeError as e:
+        log_with_user('warning', f"发送聊天消息被闲鱼拒绝: {chat_id} - {str(e)}", current_user)
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         log_with_user('error', f"发送聊天消息失败: {chat_id} - {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"发送聊天消息失败: {str(e)}")

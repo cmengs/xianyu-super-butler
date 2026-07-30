@@ -2028,7 +2028,7 @@ def generate_uuid() -> str:
     return f"-{timestamp}1"
 
 
-def generate_device_id(user_id: str) -> str:
+def _legacy_random_device_id(user_id: str) -> str:
     """生成设备ID"""
     import random
     
@@ -2051,6 +2051,19 @@ def generate_device_id(user_id: str) -> str:
                 result.append(chars[rand_val])
     
     return ''.join(result) + "-" + user_id
+
+
+def generate_device_id(user_id: str) -> str:
+    """生成稳定的账号设备ID，不在每次启动时随机变化。"""
+    import hashlib
+
+    user_id = str(user_id or '').strip() or 'unknown'
+    digest = bytearray(hashlib.sha256(f"xianyu-device:{user_id}".encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    hexed = digest.hex().upper()
+    uuid_part = f"{hexed[:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:32]}"
+    return f"{uuid_part}-{user_id}"
 
 
 def generate_sign(t: str, token: str, data: str) -> str:

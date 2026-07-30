@@ -34,7 +34,31 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     enabled: item.enabled,
     connected: item.connected,
     connection_state: item.connection_state,
+    connection_reason: item.connection_reason,
     login_required: item.login_required,
+    runtime_online: item.runtime_online,
+    ws_connected: item.ws_connected,
+    heartbeat_ok: item.heartbeat_ok,
+    heartbeat_status: item.heartbeat_status,
+    heartbeat_age_seconds: item.heartbeat_age_seconds,
+    token_ready: item.token_ready,
+    token_age_seconds: item.token_age_seconds,
+    last_token_refresh_status: item.last_token_refresh_status,
+    last_token_refresh_error: item.last_token_refresh_error,
+    token_issue: item.token_issue,
+    last_risk_control_status: item.last_risk_control_status,
+    last_risk_control_message: item.last_risk_control_message,
+    last_risk_control_at: item.last_risk_control_at,
+    last_message_received_at: item.last_message_received_at,
+    last_message_received_seconds: item.last_message_received_seconds,
+    last_send_status: item.last_send_status,
+    last_send_error: item.last_send_error,
+    last_send_code: item.last_send_code,
+    last_send_at: item.last_send_at,
+    send_channel_ok: item.send_channel_ok,
+    online_check_status: item.online_check_status,
+    online_check_message: item.online_check_message,
+    online_checked_at: item.online_checked_at,
     auto_confirm: item.auto_confirm,
     remark: item.remark,
     note: item.remark,
@@ -42,10 +66,57 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     username: item.username,
     login_password: item.login_password,
     show_browser: item.show_browser,
+    device_id: item.device_id,
     nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
     avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
     ai_enabled: false, // 需要从AI设置API获取
   }));
+};
+
+export const checkAccountOnlineStatus = async (id: string): Promise<AccountDetail> => {
+  const result = await post<any>(`/cookies/${encodeURIComponent(id)}/online-check`, {});
+  const item = result.data || result;
+  return {
+    id: item.id,
+    value: item.value,
+    cookie: item.value,
+    enabled: item.enabled,
+    connected: item.connected,
+    connection_state: item.connection_state,
+    connection_reason: item.connection_reason,
+    login_required: item.login_required,
+    runtime_online: item.runtime_online,
+    ws_connected: item.ws_connected,
+    heartbeat_ok: item.heartbeat_ok,
+    heartbeat_status: item.heartbeat_status,
+    heartbeat_age_seconds: item.heartbeat_age_seconds,
+    token_ready: item.token_ready,
+    token_age_seconds: item.token_age_seconds,
+    last_token_refresh_status: item.last_token_refresh_status,
+    last_token_refresh_error: item.last_token_refresh_error,
+    token_issue: item.token_issue,
+    last_risk_control_status: item.last_risk_control_status,
+    last_risk_control_message: item.last_risk_control_message,
+    last_risk_control_at: item.last_risk_control_at,
+    last_message_received_at: item.last_message_received_at,
+    last_message_received_seconds: item.last_message_received_seconds,
+    last_send_status: item.last_send_status,
+    last_send_error: item.last_send_error,
+    last_send_code: item.last_send_code,
+    last_send_at: item.last_send_at,
+    send_channel_ok: item.send_channel_ok,
+    online_check_status: item.online_check_status,
+    online_check_message: item.online_check_message,
+    online_checked_at: item.online_checked_at,
+    auto_confirm: item.auto_confirm ?? false,
+    remark: item.remark,
+    note: item.remark,
+    pause_duration: item.pause_duration,
+    device_id: item.device_id,
+    nickname: item.remark || `Account ${item.id.substring(0,6)}`,
+    avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`,
+    ai_enabled: false,
+  };
 };
 
 export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string }> => {
@@ -84,6 +155,7 @@ export const updateAccountLoginInfo = async (id: string, data: {
   username?: string;
   login_password?: string;
   show_browser?: boolean;
+  device_id?: string;
 }): Promise<any> => {
   return put(`/cookies/${id}/login-info`, data);
 };

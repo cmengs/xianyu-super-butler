@@ -677,12 +677,29 @@ class XianyuLive:
 
         self.myid = self.cookies['unb']
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
+        recent_qr_login_time = XianyuLive._recent_qr_login_times.get(str(cookie_id), 0)
+        account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+        account_device_id = str(account_info.get('device_id') or '').strip()
         cached_ws_session = db_manager.get_account_ws_session(self.cookie_id)
+        if recent_qr_login_time and cached_ws_session:
+            logger.warning(
+                f"【{self.cookie_id}】检测到刚完成扫码登录，清理旧消息 Token 缓存并重新申请"
+            )
+            db_manager.delete_account_ws_token(self.cookie_id)
+            cached_ws_session = None
         cached_device_id = (
             str(cached_ws_session.get('device_id') or '')
             if cached_ws_session else ''
         )
-        self.device_id = cached_device_id or generate_device_id(self.myid)
+        self.device_id = account_device_id or cached_device_id or generate_device_id(self.myid)
+        if not account_device_id:
+            db_manager.update_cookie_account_info(self.cookie_id, device_id=self.device_id)
+        if account_device_id and cached_device_id and cached_device_id != account_device_id:
+            logger.warning(
+                f"【{self.cookie_id}】账号 device_id 已修改，清理旧设备绑定的消息 Token 缓存"
+            )
+            db_manager.delete_account_ws_token(self.cookie_id)
+            cached_ws_session = None
 
         # 心跳相关配置
         self.heartbeat_interval = HEARTBEAT_INTERVAL
@@ -708,6 +725,8 @@ class XianyuLive:
                 f"【{self.cookie_id}】已载入上次验证成功的消息 Token，"
                 "并复用其绑定设备，本次启动优先使用现有登录状态"
             )
+        self.last_token_refresh_status = "cached" if cached_ws_token else "not_started"
+        self.last_token_refresh_error = ""
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
 
@@ -749,10 +768,7 @@ class XianyuLive:
         self.item_sync_lock = asyncio.Lock()  # 使用Lock防止重复执行商品同步
 
         # 扫码登录Cookie刷新标志
-        self.last_qr_cookie_refresh_time = XianyuLive._recent_qr_login_times.get(
-            str(cookie_id),
-            0,
-        )
+        self.last_qr_cookie_refresh_time = recent_qr_login_time
         self.qr_cookie_refresh_cooldown = 600  # 扫码登录Cookie刷新后的冷却时间：10分钟
 
         # 消息接收标识 - 用于控制Cookie刷新
@@ -796,6 +812,11 @@ class XianyuLive:
 
         # 等待 MessageSend RPC 的服务端响应，避免把“写入 WebSocket”误判为送达成功。
         self.pending_send_responses = {}
+        self.last_send_status = "unknown"
+        self.last_send_error = ""
+        self.last_send_code = None
+        self.last_send_time = 0
+        self.last_send_mid = ""
         
         # 消息去重机制：防止同一条消息被处理多次
         self.processed_message_ids = {}  # 存储已处理的消息ID和时间戳 {message_id: timestamp}
@@ -851,6 +872,61 @@ class XianyuLive:
     def get_cached_connection_status(cls, cookie_id: str):
         """获取实例退出前保留的最后连接状态。"""
         return dict(cls._connection_status_cache.get(str(cookie_id), {}))
+
+    def _record_send_status(self, status: str, code=None, error: str = "", mid: str = ""):
+        """记录最近一次消息发送结果，供账号状态检测展示。"""
+        self.last_send_status = status
+        self.last_send_code = code
+        self.last_send_error = self._safe_str(error) if error else ""
+        self.last_send_time = time.time()
+        self.last_send_mid = mid
+
+    def get_runtime_status(self) -> dict:
+        """返回当前实时实例的连接、心跳、Token 和发信状态。"""
+        now = time.time()
+        state = getattr(self, 'connection_state', None)
+        state_value = getattr(state, 'value', str(state or 'disconnected'))
+        ws_connected = bool(self.ws and not self.ws.closed)
+
+        heartbeat_age = None
+        if self.last_heartbeat_response:
+            heartbeat_age = max(0, int(now - self.last_heartbeat_response))
+
+        token_age = None
+        if self.last_token_refresh_time:
+            token_age = max(0, int(now - self.last_token_refresh_time))
+
+        last_message_age = None
+        if self.last_message_received_time:
+            last_message_age = max(0, int(now - self.last_message_received_time))
+
+        return {
+            "connection_state": state_value,
+            "connection_reason": getattr(self, 'connection_reason', '') or '',
+            "ws_connected": ws_connected,
+            "heartbeat_age_seconds": heartbeat_age,
+            "last_successful_connection": self.last_successful_connection or None,
+            "connection_failures": self.connection_failures,
+            "device_id": self.device_id,
+            "last_qr_cookie_refresh_at": self.last_qr_cookie_refresh_time or None,
+            "last_qr_cookie_refresh_seconds": (
+                max(0, int(now - self.last_qr_cookie_refresh_time))
+                if self.last_qr_cookie_refresh_time else None
+            ),
+            "token_ready": bool(self.current_token),
+            "token_age_seconds": token_age,
+            "last_token_refresh_status": getattr(self, 'last_token_refresh_status', None),
+            "last_token_refresh_error": getattr(self, 'last_token_refresh_error', ""),
+            "last_message_received_at": self.last_message_received_time or None,
+            "last_message_received_seconds": last_message_age,
+            "last_send_status": self.last_send_status,
+            "last_send_error": self.last_send_error,
+            "last_send_code": self.last_send_code,
+            "last_send_at": self.last_send_time or None,
+            "last_send_mid": self.last_send_mid,
+            "reconnect_blocked": self.reconnect_blocked,
+            "reconnect_block_reason": self.reconnect_block_reason,
+        }
 
     @classmethod
     def get_all_instances(cls):
@@ -1988,6 +2064,8 @@ class XianyuLive:
 
             # 检查滑块验证重试次数，防止无限递归
             if captcha_retry_count >= self.max_captcha_verification_count:
+                self.last_token_refresh_status = "captcha_max_retries"
+                self.last_token_refresh_error = "滑块验证重试次数已达上限，请手动处理"
                 logger.error(f"【{self.cookie_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
                 await self.send_token_refresh_notification(
                     f"滑块验证重试次数已达上限，请手动处理",
@@ -2186,10 +2264,13 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
                                 # 标记为成功
                                 self.last_token_refresh_status = "success"
+                                self.last_token_refresh_error = ""
                                 return new_token
 
                     # 检查是否需要滑块验证
                     if self._need_captcha_verification(res_json):
+                        self.last_token_refresh_status = "needs_verification"
+                        self.last_token_refresh_error = "闲鱼要求完成风控验证"
                         logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
 
                         # 记录滑块验证检测到日志文件
@@ -2242,6 +2323,8 @@ class XianyuLive:
                                 # 重新尝试刷新token（递归调用，但有深度限制）
                                 return await self.refresh_token(captcha_retry_count + 1)
                             else:
+                                self.last_token_refresh_status = "captcha_failed"
+                                self.last_token_refresh_error = "风控验证未完成，请重新扫码后完成验证"
                                 logger.error(f"【{self.cookie_id}】滑块验证失败")
 
                                 # 更新风控日志为失败状态
@@ -2259,6 +2342,8 @@ class XianyuLive:
                                 # 标记已发送通知（通知已在_handle_captcha_verification中发送）
                                 notification_sent = True
                         except Exception as captcha_e:
+                            self.last_token_refresh_status = "captcha_exception"
+                            self.last_token_refresh_error = self._safe_str(captcha_e)
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
 
                             # 更新风控日志为异常状态
@@ -2297,6 +2382,8 @@ class XianyuLive:
                                 # 刷新失败时继续执行原有的失败处理逻辑
 
                     logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
+                    self.last_token_refresh_status = "failed"
+                    self.last_token_refresh_error = self._safe_str(res_json)
 
                     # 清空当前token，确保下次重试时重新获取
                     self.current_token = None
@@ -2321,6 +2408,8 @@ class XianyuLive:
                     return None
 
         except Exception as e:
+            self.last_token_refresh_status = "exception"
+            self.last_token_refresh_error = self._safe_str(e)
             logger.error(f"Token刷新异常: {self._safe_str(e)}")
 
             # 清空当前token，确保下次重试时重新获取
@@ -6473,6 +6562,7 @@ class XianyuLive:
                 detail = self._safe_str(response_body)
                 if len(detail) > 300:
                     detail = detail[:300] + "..."
+                self._record_send_status("failed", response_code, detail, message_mid)
                 raise RuntimeError(f"闲鱼拒绝发送消息（code={response_code}）：{detail}")
 
             from db_manager import db_manager
@@ -6488,9 +6578,16 @@ class XianyuLive:
                 f"【{self.cookie_id}】闲鱼确认消息发送成功: "
                 f"chat={cid}, user={toid}, mid={message_mid}"
             )
+            self._record_send_status("ok", 200, "", message_mid)
             return response
         except asyncio.TimeoutError as e:
-            raise RuntimeError("等待闲鱼确认消息发送超时，请检查账号连接后重试") from e
+            error_message = "等待闲鱼确认消息发送超时，请检查账号连接后重试"
+            self._record_send_status("timeout", None, error_message, message_mid)
+            raise RuntimeError(error_message) from e
+        except Exception as e:
+            if self.last_send_mid != message_mid:
+                self._record_send_status("failed", None, self._safe_str(e), message_mid)
+            raise
         finally:
             self.pending_send_responses.pop(message_mid, None)
 

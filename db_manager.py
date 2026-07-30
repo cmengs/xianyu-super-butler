@@ -21,6 +21,17 @@ except ImportError:
         pass
 
 
+def _stable_account_device_id(account_id: str) -> str:
+    """Build a stable per-account device id without using runtime randomness."""
+    account_id = str(account_id or '').strip() or 'unknown'
+    digest = bytearray(hashlib.sha256(f"xianyu-device:{account_id}".encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    hexed = digest.hex().upper()
+    uuid_part = f"{hexed[:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:32]}"
+    return f"{uuid_part}-{account_id}"
+
+
 _PLATFORM_CHAT_NAMES = {
     '未知用户',
     '工作台通知',
@@ -131,6 +142,7 @@ class DBManager:
 
         self.init_db()
         self._ensure_account_ws_tokens_table()
+        self._ensure_cookie_device_id_column()
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -190,6 +202,7 @@ class DBManager:
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
                 show_browser INTEGER DEFAULT 0,
+                device_id TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -882,6 +895,87 @@ class DBManager:
                 )
             self.conn.commit()
 
+    def _ensure_cookie_device_id_column(self):
+        """Persist a stable device id on each account instead of regenerating it."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if self.db_type == 'mysql':
+                    cursor.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = ?
+                          AND table_name = 'cookies'
+                          AND column_name = 'device_id'
+                        """,
+                        (self.database_config['database'],),
+                    )
+                    if not cursor.fetchone():
+                        cursor.execute(
+                            "ALTER TABLE cookies ADD COLUMN device_id VARCHAR(191) DEFAULT ''"
+                        )
+                        logger.info("已为 cookies 表添加 device_id 字段")
+                else:
+                    cursor.execute("PRAGMA table_info(cookies)")
+                    cookie_columns = [column[1] for column in cursor.fetchall()]
+                    if 'device_id' not in cookie_columns:
+                        cursor.execute("ALTER TABLE cookies ADD COLUMN device_id TEXT DEFAULT ''")
+                        logger.info("已为 cookies 表添加 device_id 字段")
+
+                if self.db_type == 'mysql':
+                    cursor.execute(
+                        """
+                        UPDATE cookies c
+                        JOIN account_ws_tokens t ON t.cookie_id = c.id
+                        SET c.device_id = t.device_id
+                        WHERE (c.device_id IS NULL OR c.device_id = '')
+                          AND t.device_id IS NOT NULL
+                          AND t.device_id != ''
+                        """
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE cookies
+                        SET device_id = (
+                            SELECT account_ws_tokens.device_id
+                            FROM account_ws_tokens
+                            WHERE account_ws_tokens.cookie_id = cookies.id
+                        )
+                        WHERE (device_id IS NULL OR device_id = '')
+                          AND EXISTS (
+                            SELECT 1
+                            FROM account_ws_tokens
+                            WHERE account_ws_tokens.cookie_id = cookies.id
+                              AND account_ws_tokens.device_id IS NOT NULL
+                              AND account_ws_tokens.device_id != ''
+                          )
+                        """
+                    )
+
+                cursor.execute(
+                    "SELECT id FROM cookies WHERE device_id IS NULL OR device_id = ''"
+                )
+                empty_device_rows = cursor.fetchall()
+                if empty_device_rows:
+                    cursor.executemany(
+                        "UPDATE cookies SET device_id = ? WHERE id = ?",
+                        [
+                            (_stable_account_device_id(row[0]), row[0])
+                            for row in empty_device_rows
+                        ],
+                    )
+                    logger.info(f"已为 {len(empty_device_rows)} 个账号生成固定 device_id")
+
+                self.conn.commit()
+            except Exception as e:
+                try:
+                    self.conn.rollback()
+                except Exception as rollback_error:
+                    logger.warning(f"账号 device_id 迁移回滚失败: {rollback_error}")
+                logger.warning(f"确保账号 device_id 字段失败: {e}")
+
     def get_account_ws_session(self, cookie_id: str) -> Optional[Dict[str, str]]:
         """读取账号已验证的消息 Token 及其绑定设备，不输出 Token 内容。"""
         with self.lock:
@@ -948,6 +1042,12 @@ class DBManager:
                         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                         """,
                         (str(cookie_id), str(token), str(device_id or '')),
+                    )
+                if device_id:
+                    self._execute_sql(
+                        cursor,
+                        "UPDATE cookies SET device_id = COALESCE(NULLIF(device_id, ''), ?) WHERE id = ?",
+                        (str(device_id), str(cookie_id)),
                     )
                 self.conn.commit()
                 logger.info(f"账号 {cookie_id} 的消息 Token 已安全缓存")
@@ -1951,10 +2051,20 @@ class DBManager:
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
-                self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, cookie_value, user_id)
-                )
+                self._execute_sql(cursor, "SELECT id, device_id FROM cookies WHERE id = ?", (cookie_id,))
+                existing_cookie = cursor.fetchone()
+                if existing_cookie:
+                    self._execute_sql(
+                        cursor,
+                        "UPDATE cookies SET value = ?, user_id = ?, device_id = COALESCE(NULLIF(device_id, ''), ?) WHERE id = ?",
+                        (cookie_value, user_id, _stable_account_device_id(cookie_id), cookie_id)
+                    )
+                else:
+                    self._execute_sql(
+                        cursor,
+                        "INSERT INTO cookies (id, value, user_id, device_id) VALUES (?, ?, ?, ?)",
+                        (cookie_id, cookie_value, user_id, _stable_account_device_id(cookie_id))
+                    )
 
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
@@ -2053,7 +2163,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, device_id, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     return {
@@ -2066,10 +2176,31 @@ class DBManager:
                         'username': result[6] or '',
                         'password': result[7] or '',
                         'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9]
+                        'device_id': result[9] or '',
+                        'created_at': result[10]
                     }
                 return None
             except Exception as e:
+                if 'device_id' in str(e):
+                    try:
+                        self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                        result = cursor.fetchone()
+                        if result:
+                            return {
+                                'id': result[0],
+                                'value': result[1],
+                                'user_id': result[2],
+                                'auto_confirm': bool(result[3]),
+                                'remark': result[4] or '',
+                                'pause_duration': result[5] if result[5] is not None else 10,
+                                'username': result[6] or '',
+                                'password': result[7] or '',
+                                'show_browser': bool(result[8]) if result[8] is not None else False,
+                                'device_id': _stable_account_device_id(cookie_id),
+                                'created_at': result[9]
+                            }
+                    except Exception as fallback_error:
+                        logger.error(f"获取Cookie详细信息兼容查询失败: {fallback_error}")
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
 
@@ -2134,7 +2265,7 @@ class DBManager:
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
-    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
+    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None, device_id: str = None) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
         """
@@ -2178,6 +2309,10 @@ class DBManager:
                         insert_fields.append('show_browser')
                         insert_values.append(1 if show_browser else 0)
                         insert_placeholders.append('?')
+
+                    insert_fields.append('device_id')
+                    insert_values.append(device_id or _stable_account_device_id(cookie_id))
+                    insert_placeholders.append('?')
                     
                     sql = f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(insert_placeholders)})"
                     self._execute_sql(cursor, sql, tuple(insert_values))
@@ -2205,6 +2340,10 @@ class DBManager:
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")
                         params.append(1 if show_browser else 0)
+
+                    if device_id is not None:
+                        update_fields.append("device_id = ?")
+                        params.append(device_id or _stable_account_device_id(cookie_id))
                     
                     if not update_fields:
                         logger.warning(f"更新账号 {cookie_id} 信息时没有提供任何更新字段")
