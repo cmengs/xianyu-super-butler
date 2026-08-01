@@ -9,6 +9,7 @@ import time
 import uuid
 import json
 import re
+import os
 from random import random
 from typing import Optional, Dict, Any
 import httpx
@@ -60,6 +61,10 @@ class QRLoginSession:
         self.expire_time = 300  # 5分钟过期
         self.params = {}  # 存储登录参数
         self.verification_url = None  # 风控验证URL
+        self.verification_browser_opening = False
+        self.verification_browser_opened = False
+        self.verification_playwright = None
+        self.verification_browser = None
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -302,6 +307,137 @@ class QRLoginManager:
             )
             return resp
 
+    async def _open_verification_browser(self, session: QRLoginSession):
+        """Open the QR risk-control URL in a visible browser for noVNC/manual handling."""
+        if not session.verification_url or session.verification_browser_opening or session.verification_browser_opened:
+            return
+
+        session.verification_browser_opening = True
+        try:
+            import concurrent.futures
+            from utils.xianyu_slider_stealth import XianyuSliderStealth
+
+            session.verification_browser_opened = True
+            slider_stealth = XianyuSliderStealth(
+                user_id=f"qr_{session.session_id}",
+                enable_learning=False,
+                headless=False,
+            )
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                success, updated_cookies = await loop.run_in_executor(
+                    executor,
+                    slider_stealth.run_manual,
+                    session.verification_url,
+                    dict(session.cookies or {}),
+                    300,
+                )
+            if success and updated_cookies:
+                for k, v in updated_cookies.items():
+                    session.cookies[k] = v
+                    if k == 'unb':
+                        session.unb = v
+                if session.unb:
+                    session.status = 'success'
+                    logger.info(f"扫码风控验证完成: {session.session_id}, UNB: {session.unb}")
+                else:
+                    logger.warning(f"扫码风控验证完成但未拿到UNB: {session.session_id}")
+            elif success:
+                logger.info(f"扫码风控验证页面已离开风控页，继续等待登录状态: {session.session_id}")
+            else:
+                logger.warning(f"扫码风控验证未完成或超时: {session.session_id}")
+            return
+        except Exception as e:
+            logger.error(f"打开扫码风控验证页面失败: {session.session_id} - {e}")
+            return
+        finally:
+            session.verification_browser_opening = False
+            if session.status != 'success':
+                session.verification_browser_opened = False
+
+        playwright = None
+        browser = None
+        try:
+            from playwright.async_api import async_playwright
+
+            playwright = await async_playwright().start()
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--window-size=1365,768',
+            ]
+            headless = not (os.name == 'nt' or bool(os.getenv('DISPLAY')))
+
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=browser_args,
+            )
+            context = await browser.new_context(
+                viewport={'width': 1365, 'height': 768},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+            )
+
+            cookies = []
+            for name, value in session.cookies.items():
+                if not value:
+                    continue
+                for domain in ('.goofish.com', '.taobao.com', '.alibaba.com'):
+                    cookies.append({
+                        'name': name,
+                        'value': value,
+                        'domain': domain,
+                        'path': '/',
+                    })
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception as cookie_error:
+                    logger.warning(f"打开扫码验证浏览器时设置Cookie失败: {cookie_error}")
+
+            page = await context.new_page()
+            await page.goto(session.verification_url, wait_until='domcontentloaded', timeout=30000)
+
+            session.verification_playwright = playwright
+            session.verification_browser = browser
+            session.verification_browser_opened = True
+            logger.warning(f"已打开扫码风控验证页面，请到 noVNC/浏览器中完成验证: {session.session_id}")
+        except Exception as e:
+            logger.error(f"打开扫码风控验证页面失败: {session.session_id} - {e}")
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if playwright:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    pass
+        finally:
+            session.verification_browser_opening = False
+
+    async def _close_verification_browser(self, session: QRLoginSession):
+        """Close any browser opened for QR risk-control handling."""
+        browser = session.verification_browser
+        playwright = session.verification_playwright
+        session.verification_browser = None
+        session.verification_playwright = None
+        session.verification_browser_opened = False
+        try:
+            if browser:
+                await browser.close()
+        except Exception as e:
+            logger.debug(f"关闭扫码验证浏览器失败: {e}")
+        try:
+            if playwright:
+                await playwright.stop()
+        except Exception as e:
+            logger.debug(f"关闭扫码验证Playwright失败: {e}")
+
     async def _monitor_qr_status(self, session_id: str):
         """监控二维码状态"""
         try:
@@ -347,9 +483,13 @@ class QRLoginManager:
                                 .get("data", {})
                                 .get("iframeRedirectUrl")
                             )
+                            for k, v in resp.cookies.items():
+                                session.cookies[k] = v
                             session.verification_url = iframe_url
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
-                            break
+                            asyncio.create_task(self._open_verification_browser(session))
+                            await asyncio.sleep(2)
+                            continue
                         else:
                             # 登录成功
                             session.status = 'success'
@@ -391,9 +531,12 @@ class QRLoginManager:
                     await asyncio.sleep(2)
 
             # 超时处理
-            if session.status not in ['success', 'expired', 'cancelled', 'verification_required']:
+            if session.status not in ['success', 'expired', 'cancelled']:
                 session.status = 'expired'
                 logger.info(f"二维码监控超时，标记为过期: {session_id}")
+
+            if session.status in ['success', 'expired', 'cancelled']:
+                await self._close_verification_browser(session)
 
         except Exception as e:
             logger.error(f"监控二维码状态失败: {e}")
@@ -417,7 +560,12 @@ class QRLoginManager:
         # 如果需要验证，返回验证URL
         if session.status == 'verification_required' and session.verification_url:
             result['verification_url'] = session.verification_url
-            result['message'] = '账号被风控，需要手机验证'
+            if session.verification_browser_opened:
+                result['message'] = '账号触发风控，已在 noVNC 打开验证页面，请完成验证'
+            elif session.verification_browser_opening:
+                result['message'] = '账号触发风控，正在打开 noVNC 验证页面...'
+            else:
+                result['message'] = '账号触发风控，需要完成安全验证'
 
         # 如果登录成功，返回Cookie信息
         if session.status == 'success' and session.cookies and session.unb:
@@ -434,6 +582,9 @@ class QRLoginManager:
                 expired_sessions.append(session_id)
 
         for session_id in expired_sessions:
+            session = self.sessions[session_id]
+            if session.verification_browser or session.verification_playwright:
+                asyncio.create_task(self._close_verification_browser(session))
             del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")
 

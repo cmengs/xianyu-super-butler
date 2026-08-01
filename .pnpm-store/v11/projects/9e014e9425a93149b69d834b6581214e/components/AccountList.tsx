@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, AIReplySettings } from '../types';
 import {
@@ -15,7 +15,8 @@ import {
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
-  checkAccountOnlineStatus
+  checkAccountOnlineStatus,
+  startAccountManualVerification
 } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
@@ -34,9 +35,14 @@ const AccountList: React.FC = () => {
   const [qrStatus, setQrStatus] = useState<string>('pending');
   const [qrMessage, setQrMessage] = useState<string>('');
   const [qrTargetAccount, setQrTargetAccount] = useState<AccountDetail | null>(null);
+  const [qrVerificationUrl, setQrVerificationUrl] = useState<string>('');
+  const qrPollTimerRef = useRef<number | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [checkingAccountId, setCheckingAccountId] = useState<string | null>(null);
+  const [verifyingAccountId, setVerifyingAccountId] = useState<string | null>(null);
+  const [novncModal, setNovncModal] = useState<{ url: string; account: AccountDetail | null; message: string } | null>(null);
+  const autoVerificationRef = useRef<Record<string, number>>({});
 
   // 编辑表单状态
   const [editForm, setEditForm] = useState({
@@ -145,6 +151,49 @@ const AccountList: React.FC = () => {
       setCheckingAccountId(null);
     }
   };
+
+  const getFallbackNovncUrl = () => (
+    `${window.location.protocol}//${window.location.hostname}:26080/vnc.html?autoconnect=true&resize=scale&password=${encodeURIComponent('xianyu')}`
+  );
+
+  const needsManualVerification = (account: AccountDetail) => (
+    Boolean(account.enabled) && (
+      account.online_check_status === 'needs_verification' ||
+      account.connection_state === 'verifying' ||
+      Boolean(account.token_issue)
+    )
+  );
+
+  const startManualVerification = async (account: AccountDetail, auto = false) => {
+    setVerifyingAccountId(account.id);
+    try {
+      const result = await startAccountManualVerification(account.id);
+      setNovncModal({
+        url: result.novnc_url || getFallbackNovncUrl(),
+        account,
+        message: result.message || '检测到闲鱼风控，已自动打开 noVNC 验证面板',
+      });
+      loadAccounts(true);
+    } catch (error) {
+      if (!auto) {
+        alert(error instanceof Error ? error.message : '打开验证浏览器失败');
+      }
+    } finally {
+      setVerifyingAccountId(null);
+    }
+  };
+
+  useEffect(() => {
+    const target = accounts.find(account => needsManualVerification(account));
+    if (!target || verifyingAccountId) return;
+
+    const now = Date.now();
+    const lastStartedAt = autoVerificationRef.current[target.id] || 0;
+    if (now - lastStartedAt < 120000) return;
+
+    autoVerificationRef.current[target.id] = now;
+    startManualVerification(target, true);
+  }, [accounts, verifyingAccountId]);
 
   const renderConnectionBadge = (account: AccountDetail) => {
     if (!account.enabled) {
@@ -346,45 +395,77 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const clearQRPollTimer = () => {
+    if (qrPollTimerRef.current !== null) {
+      window.clearInterval(qrPollTimerRef.current);
+      qrPollTimerRef.current = null;
+    }
+  };
+
   const closeQRModal = () => {
+    clearQRPollTimer();
     setShowQRModal(false);
     setQrTargetAccount(null);
     setQrMessage('');
+    setQrVerificationUrl('');
   };
 
   const startQRLogin = async (targetAccount?: AccountDetail) => {
+    clearQRPollTimer();
     const target = targetAccount || null;
     setQrTargetAccount(target);
     setShowQRModal(true);
     setQrStatus('loading');
     setQrMessage('');
+    setQrVerificationUrl('');
     try {
       const res = await generateQRLogin();
       if (res.success && res.qr_code_url && res.session_id) {
         setQrCodeUrl(res.qr_code_url);
         setQrStatus('waiting');
+        setQrMessage('请尽快扫码，二维码有效期为5分钟');
 
-        const interval = setInterval(async () => {
-          const statusRes = await checkQRLoginStatus(res.session_id!);
-          if (statusRes.status === 'success') {
-            clearInterval(interval);
-            const actualAccountId = statusRes.account_info?.account_id;
-            if (target && actualAccountId && actualAccountId !== target.id) {
+        qrPollTimerRef.current = window.setInterval(async () => {
+          try {
+            const statusRes = await checkQRLoginStatus(res.session_id!);
+            if (statusRes.status === 'success') {
+              clearQRPollTimer();
+              const actualAccountId = statusRes.account_info?.account_id;
+              if (target && actualAccountId && actualAccountId !== target.id) {
+                setQrStatus('error');
+                setQrMessage(`扫码账号不匹配，实际登录账号为 ${actualAccountId}`);
+                loadAccounts();
+                return;
+              }
+              setQrStatus('success');
+              setQrMessage(target ? '账号凭证已更新，实时任务正在恢复' : '登录成功');
+              window.setTimeout(() => {
+                closeQRModal();
+                loadAccounts();
+              }, 1500);
+            } else if (statusRes.status === 'scanned') {
+              setQrStatus('scanned');
+              setQrMessage(statusRes.message || '已扫码，请在手机上确认登录');
+            } else if (statusRes.status === 'processing') {
+              setQrStatus('processing');
+              setQrMessage(statusRes.message || '扫码成功，正在刷新登录凭证...');
+            } else if (statusRes.status === 'verification_required') {
+              setQrStatus('verification');
+              setQrVerificationUrl(statusRes.verification_url || '');
+              setQrMessage(statusRes.message || '账号触发风控，请在 noVNC 中完成验证');
+              setNovncModal(current => current || {
+                url: statusRes.novnc_url || getFallbackNovncUrl(),
+                account: target,
+                message: statusRes.message || '扫码触发闲鱼风控，已自动打开 noVNC 验证面板',
+              });
+            } else if (['expired', 'error', 'cancelled', 'not_found'].includes(statusRes.status)) {
+              clearQRPollTimer();
               setQrStatus('error');
-              setQrMessage(`扫码账号不匹配，实际登录账号为 ${actualAccountId}`);
-              loadAccounts();
-              return;
+              setQrMessage(statusRes.message || '二维码已失效，请重试');
             }
-            setQrStatus('success');
-            setQrMessage(target ? '账号凭证已更新，实时任务正在恢复' : '登录成功');
-            setTimeout(() => {
-              closeQRModal();
-              loadAccounts();
-            }, 1500);
-          } else if (statusRes.status === 'expired' || statusRes.status === 'error') {
-            clearInterval(interval);
-            setQrStatus('error');
-            setQrMessage(statusRes.message || '二维码已失效，请重试');
+          } catch (pollError) {
+            setQrStatus('processing');
+            setQrMessage(pollError instanceof Error ? pollError.message : '正在等待服务端返回扫码结果...');
           }
         }, 2000);
       } else {
@@ -396,6 +477,10 @@ const AccountList: React.FC = () => {
       setQrMessage(e instanceof Error ? e.message : '二维码生成失败');
     }
   };
+
+  useEffect(() => {
+    return () => clearQRPollTimer();
+  }, []);
 
   if (loading) return <div className="p-20 flex justify-center"><Loader2 className="w-8 h-8 text-[#FFE815] animate-spin"/></div>;
 
@@ -543,7 +628,25 @@ const AccountList: React.FC = () => {
 
                           <div className="w-64 h-64 bg-[#F7F8FA] rounded-[2rem] mx-auto flex items-center justify-center overflow-hidden border-4 border-white shadow-inner mb-8 relative">
                               {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
-                              {qrStatus === 'waiting' && <img src={qrCodeUrl} alt="QR Code" className="w-full h-full p-2" />}
+                              {['waiting', 'scanned', 'processing', 'verification'].includes(qrStatus) && <img src={qrCodeUrl} alt="QR Code" className="w-full h-full p-2" />}
+                              {['scanned', 'processing', 'verification'].includes(qrStatus) && (
+                                  <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-amber-700 animate-fade-in px-5">
+                                      <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mb-4">
+                                         {qrStatus === 'processing' || qrStatus === 'verification' ? <Loader2 className="w-8 h-8 animate-spin" /> : <Check className="w-8 h-8" />}
+                                      </div>
+                                      <span className="font-bold text-base leading-relaxed">{qrMessage || '正在处理扫码登录...'}</span>
+                                      {qrStatus === 'verification' && qrVerificationUrl && (
+                                        <a
+                                          href={qrVerificationUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          className="mt-4 text-xs bg-amber-100 px-3 py-1.5 rounded-full hover:bg-amber-200"
+                                        >
+                                          打开验证链接
+                                        </a>
+                                      )}
+                                  </div>
+                              )}
                               {qrStatus === 'success' && (
                                   <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-green-600 animate-fade-in">
                                       <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
@@ -560,8 +663,50 @@ const AccountList: React.FC = () => {
                               )}
                           </div>
 
-                          <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl">二维码有效期为5分钟，请尽快扫码。</p>
+                          <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl">{qrMessage || '二维码有效期为5分钟，请尽快扫码。'}</p>
                       </div>
+                  </div>
+              </div>
+          </div>,
+          document.body
+      )}
+
+      {novncModal && createPortal(
+          <div className="modal-overlay-centered">
+              <div className="modal-container" style={{width: 'min(1180px, 96vw)', maxWidth: '96vw'}}>
+                  <div className="modal-header">
+                    <div>
+                      <h3 className="text-2xl font-extrabold text-gray-900">闲鱼风控验证</h3>
+                      <p className="text-sm text-gray-500 mt-1">
+                        {novncModal.account?.nickname || novncModal.account?.remark || novncModal.account?.id}
+                        {' · '}
+                        {novncModal.message}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setNovncModal(null)}
+                      className="p-2 rounded-xl hover:bg-gray-100 transition-colors flex-shrink-0"
+                    >
+                      <X className="w-5 h-5 text-gray-500" />
+                    </button>
+                  </div>
+                  <div className="modal-body">
+                    <iframe
+                      src={novncModal.url}
+                      title="noVNC"
+                      className="w-full h-[72vh] rounded-2xl bg-black border border-gray-200"
+                    />
+                    <div className="flex items-center justify-between mt-4 text-sm text-gray-500">
+                      <span>验证完成后账号会自动回收 Cookie 并重启任务。</span>
+                      <a
+                        href={novncModal.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-amber-700 font-bold hover:text-amber-800"
+                      >
+                        新窗口打开
+                      </a>
+                    </div>
                   </div>
               </div>
           </div>,

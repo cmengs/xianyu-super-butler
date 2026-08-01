@@ -119,6 +119,10 @@ export const checkAccountOnlineStatus = async (id: string): Promise<AccountDetai
   };
 };
 
+export const startAccountManualVerification = async (id: string): Promise<ApiResponse & { novnc_url?: string }> => {
+  return post(`/cookies/${encodeURIComponent(id)}/manual-verification`, {});
+};
+
 export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string }> => {
   return post('/qr-login/generate');
 };

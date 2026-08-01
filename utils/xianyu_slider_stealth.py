@@ -439,6 +439,70 @@ class XianyuSliderStealth:
             self._cleanup_on_init_failure()
             raise
     
+    def init_manual_browser(self):
+        """Initialize a visible persistent browser for manual verification/noVNC."""
+        try:
+            logger.info(f"【{self.pure_user_id}】启动持久化人工验证浏览器...")
+            self.playwright = sync_playwright().start()
+            browser_features = self._get_random_browser_features()
+
+            profile_root = os.getenv("BROWSER_DATA_DIR", "browser_data")
+            user_data_dir = os.path.abspath(os.path.join(profile_root, f"user_{self.pure_user_id}"))
+            os.makedirs(user_data_dir, exist_ok=True)
+            logger.info(f"【{self.pure_user_id}】人工验证浏览器数据目录: {user_data_dir}")
+
+            browser_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-blink-features=AutomationControlled",
+                "--start-maximized",
+                f"--window-size={browser_features['window_size']}",
+                f"--lang={browser_features['lang']}",
+                f"--accept-lang={browser_features['accept_lang']}",
+                "--disable-popup-blocking",
+                "--password-store=basic",
+                "--use-mock-keychain",
+                "--allow-pre-commit-input",
+            ]
+
+            context_options = {
+                "headless": self.headless,
+                "args": browser_args,
+                "user_agent": browser_features["user_agent"],
+                "locale": browser_features["locale"],
+                "timezone_id": browser_features["timezone_id"],
+                "ignore_https_errors": False,
+            }
+            if not self.headless:
+                context_options["no_viewport"] = True
+            else:
+                context_options.update({
+                    "viewport": {
+                        "width": browser_features["viewport_width"],
+                        "height": browser_features["viewport_height"],
+                    },
+                    "device_scale_factor": browser_features["device_scale_factor"],
+                    "is_mobile": browser_features["is_mobile"],
+                    "has_touch": browser_features["has_touch"],
+                })
+
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                **context_options,
+            )
+            self.browser = None
+            self.context.add_init_script(self._get_stealth_script(browser_features))
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            logger.info(f"【{self.pure_user_id}】持久化人工验证浏览器初始化完成")
+            return self.page
+        except Exception as e:
+            logger.error(f"【{self.pure_user_id}】初始化持久化人工验证浏览器失败: {e}")
+            self._cleanup_on_init_failure()
+            raise
+
     def _cleanup_on_init_failure(self):
         """初始化失败时的清理"""
         try:
@@ -4375,19 +4439,27 @@ class XianyuSliderStealth:
         """打开可见浏览器，等待用户手动完成风控验证。"""
         try:
             self.headless = False
-            self.init_browser()
+            self.init_manual_browser()
 
             if initial_cookies:
-                browser_cookies = [
-                    {
-                        "name": str(name),
-                        "value": str(value),
-                        "domain": ".goofish.com",
-                        "path": "/",
-                    }
-                    for name, value in initial_cookies.items()
-                    if name and value is not None
-                ]
+                browser_cookies = []
+                for name, value in initial_cookies.items():
+                    if not name or value is None:
+                        continue
+                    for domain in (
+                        ".goofish.com",
+                        ".taobao.com",
+                        ".alibaba.com",
+                        ".tmall.com",
+                    ):
+                        browser_cookies.append(
+                            {
+                                "name": str(name),
+                                "value": str(value),
+                                "domain": domain,
+                                "path": "/",
+                            }
+                        )
                 try:
                     self.context.add_cookies(browser_cookies)
                     logger.info(
@@ -4420,6 +4492,7 @@ class XianyuSliderStealth:
                 if cookie.get("name", "").lower().startswith("x5")
                 or "x5sec" in cookie.get("name", "").lower()
             }
+            minimum_wait_until = time.time() + 8
             deadline = time.time() + max(30, timeout_seconds)
 
             while time.time() < deadline:
@@ -4429,6 +4502,14 @@ class XianyuSliderStealth:
 
                 current_url = self.page.url or ""
                 current_url_lower = current_url.lower()
+                try:
+                    page_content_lower = self.page.content().lower()
+                except Exception:
+                    page_content_lower = ""
+                abnormal_traffic_page = (
+                    "unusual traffic" in page_content_lower
+                    or "something's wrong" in page_content_lower
+                )
                 current_x5 = {
                     cookie["name"]: cookie["value"]
                     for cookie in self.context.cookies()
@@ -4444,6 +4525,8 @@ class XianyuSliderStealth:
                     and "punish" not in current_url_lower
                     and "captcha" not in current_url_lower
                     and "x5step" not in current_url_lower
+                    and time.time() >= minimum_wait_until
+                    and not abnormal_traffic_page
                 )
 
                 if x5_updated or left_challenge_page:

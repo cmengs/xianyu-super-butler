@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 import hashlib
 import secrets
 import time
@@ -53,6 +53,7 @@ security = HTTPBearer(auto_error=False)
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
+qr_login_processing_sessions = {}  # 后台处理中的扫码session，避免前端轮询请求长时间卡住
 
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
@@ -128,6 +129,55 @@ def cleanup_qr_check_records():
             del qr_check_processed[session_id]
         if session_id in qr_check_locks:
             del qr_check_locks[session_id]
+
+    expired_processing_sessions = []
+    for session_id, record in qr_login_processing_sessions.items():
+        if current_time - record.get('timestamp', 0) > 3600:
+            task = record.get('task')
+            if task is not None and not task.done():
+                continue
+            expired_processing_sessions.append(session_id)
+
+    for session_id in expired_processing_sessions:
+        if session_id in qr_login_processing_sessions:
+            del qr_login_processing_sessions[session_id]
+
+
+async def _process_qr_login_session(session_id: str, cookies_info: Dict[str, Any], current_user: Dict[str, Any]):
+    """后台处理扫码登录Cookie，避免轮询接口一直等待浏览器/cookie刷新。"""
+    try:
+        qr_login_processing_sessions[session_id].update({
+            'status': 'processing',
+            'message': '扫码成功，正在刷新登录凭证并恢复账号任务...',
+            'timestamp': time.time(),
+        })
+
+        account_info = await process_qr_login_cookies(
+            cookies_info['cookies'],
+            cookies_info['unb'],
+            current_user
+        )
+
+        qr_login_processing_sessions[session_id].update({
+            'status': 'success',
+            'message': '登录凭证已更新',
+            'account_info': account_info,
+            'timestamp': time.time(),
+        })
+        qr_check_processed[session_id] = {
+            'processed': True,
+            'timestamp': time.time(),
+            'account_info': account_info,
+        }
+
+        log_with_user('info', f"扫码登录后台处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
+    except Exception as e:
+        qr_login_processing_sessions[session_id].update({
+            'status': 'error',
+            'message': f'扫码登录处理失败: {str(e)}',
+            'timestamp': time.time(),
+        })
+        log_with_user('error', f"扫码登录后台处理异常: {session_id} - {str(e)}", current_user)
 
 
 def load_keywords() -> List[Tuple[str, str]]:
@@ -1663,6 +1713,48 @@ def check_cookie_online_status(cid: str, current_user: Dict[str, Any] = Depends(
     return {"success": True, "data": result, **result}
 
 
+@app.post("/cookies/{cid}/manual-verification")
+async def start_cookie_manual_verification(cid: str, request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """打开账号级可视化验证浏览器，用于处理扫码后仍需验证的 WS/Token 风控。"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权操作该账号")
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+
+        live_instance = XianyuLive.get_instance(cid)
+        if not live_instance:
+            if not cookie_manager.manager.get_cookie_status(cid):
+                raise HTTPException(status_code=400, detail="账号未启用，请先启用账号")
+            action = cookie_manager.manager.update_cookie(cid, user_cookies[cid], save_to_db=False)
+            await _await_cookie_manager_action(action)
+            await asyncio.sleep(0.5)
+            live_instance = XianyuLive.get_instance(cid)
+
+        if not live_instance:
+            raise HTTPException(status_code=500, detail="账号实例未启动，请稍后再试")
+
+        task = live_instance._create_tracked_task(
+            live_instance.open_manual_verification_browser(wait_seconds=300)
+        )
+        public_novnc_url = _build_public_novnc_url(request)
+        log_with_user('warning', f"已为账号 {cid} 打开手动风控验证浏览器任务: {id(task)}", current_user)
+        return {
+            "success": True,
+            "message": "已启动验证浏览器任务，正在打开 noVNC",
+            "novnc_url": public_novnc_url,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"打开账号手动验证失败: {cid} - {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/cookies")
 def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
@@ -1704,6 +1796,21 @@ class AccountLoginInfoUpdate(BaseModel):
     login_password: Optional[str] = None
     show_browser: Optional[bool] = None
     device_id: Optional[str] = None
+
+
+def _build_public_novnc_url(request: Request) -> str:
+    public_novnc_url = os.getenv("NOVNC_PUBLIC_URL", "").strip()
+    if public_novnc_url:
+        return public_novnc_url
+
+    request_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    public_host = request_host.split(":", 1)[0] or "127.0.0.1"
+    public_port = os.getenv("NOVNC_PUBLIC_PORT", "26080").strip() or "26080"
+    vnc_password = os.getenv("VNC_PASSWORD", "").strip()
+    novnc_query = "autoconnect=true&resize=scale"
+    if vnc_password:
+        novnc_query += f"&password={quote(vnc_password)}"
+    return f"http://{public_host}:{public_port}/vnc.html?{novnc_query}"
 
 
 def _normalize_account_device_id(device_id: Optional[str]) -> Optional[str]:
@@ -2542,7 +2649,7 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
 
 
 @app.get("/qr-login/check/{session_id}")
-async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+async def check_qr_code_status(session_id: str, request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
     try:
         # 清理过期记录
@@ -2553,8 +2660,36 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             record = qr_check_processed[session_id]
             if record['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
-                # 返回简单的成功状态，避免重复处理
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+                return {
+                    'status': 'success',
+                    'message': '该会话已处理完成',
+                    'account_info': record.get('account_info')
+                }
+
+        processing_record = qr_login_processing_sessions.get(session_id)
+        if processing_record:
+            processing_status = processing_record.get('status', 'processing')
+            if processing_status == 'success':
+                account_info = processing_record.get('account_info')
+                qr_check_processed[session_id] = {
+                    'processed': True,
+                    'timestamp': time.time(),
+                    'account_info': account_info,
+                }
+                return {
+                    'status': 'success',
+                    'message': processing_record.get('message', '登录凭证已更新'),
+                    'account_info': account_info,
+                }
+            if processing_status == 'error':
+                return {
+                    'status': 'error',
+                    'message': processing_record.get('message', '扫码登录处理失败')
+                }
+            return {
+                'status': 'processing',
+                'message': processing_record.get('message', '扫码成功，正在处理中，请稍候...')
+            }
 
         # 获取该session的锁
         session_lock = qr_check_locks[session_id]
@@ -2568,13 +2703,27 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             # 再次检查是否已处理（双重检查）
             if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
                 log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+                return {
+                    'status': 'success',
+                    'message': '该会话已处理完成',
+                    'account_info': qr_check_processed[session_id].get('account_info')
+                }
+
+            processing_record = qr_login_processing_sessions.get(session_id)
+            if processing_record:
+                return {
+                    'status': processing_record.get('status', 'processing'),
+                    'message': processing_record.get('message', '扫码成功，正在处理中，请稍候...'),
+                    'account_info': processing_record.get('account_info')
+                }
 
             # 清理过期会话
             qr_login_manager.cleanup_expired_sessions()
 
             # 获取会话状态
             status_info = qr_login_manager.get_session_status(session_id)
+            if status_info.get('status') == 'verification_required':
+                status_info['novnc_url'] = _build_public_novnc_url(request)
             log_with_user('info', f"获取会话状态1111111: {status_info}", current_user)
             if status_info['status'] == 'success':
                 log_with_user('info', f"获取会话状态22222222: {status_info}", current_user)
@@ -2582,20 +2731,24 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
                 log_with_user('info', f"获取会话Cookie: {cookies_info}", current_user)
                 if cookies_info:
-                    account_info = await process_qr_login_cookies(
-                        cookies_info['cookies'],
-                        cookies_info['unb'],
-                        current_user
-                    )
-                    status_info['account_info'] = account_info
-
-                    log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
-
-                    # 标记该session已处理
-                    qr_check_processed[session_id] = {
-                        'processed': True,
-                        'timestamp': time.time()
+                    qr_login_processing_sessions[session_id] = {
+                        'status': 'processing',
+                        'message': '扫码成功，正在刷新登录凭证并恢复账号任务...',
+                        'timestamp': time.time(),
                     }
+                    task = asyncio.create_task(_process_qr_login_session(session_id, cookies_info, dict(current_user)))
+                    qr_login_processing_sessions[session_id]['task'] = task
+                    return {
+                        'status': 'processing',
+                        'message': '扫码成功，正在刷新登录凭证并恢复账号任务...'
+                    }
+                return {'status': 'error', 'message': '扫码成功但没有获取到登录凭证，请重新扫码'}
+
+            if status_info['status'] == 'scanned':
+                status_info['message'] = status_info.get('message') or '已扫码，请在手机上确认登录'
+
+            if status_info['status'] == 'verification_required':
+                status_info['message'] = status_info.get('message') or '需要完成闲鱼安全验证后才能继续登录'
 
             return status_info
 

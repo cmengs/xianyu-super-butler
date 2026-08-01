@@ -49,7 +49,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # 复制前端构建产物到 static 目录
-COPY --from=frontend-builder /frontend/dist ./static
+COPY --from=frontend-builder /static ./static
 
 # 项目已完全开源，无需编译二进制模块
 
@@ -112,6 +112,8 @@ RUN apt-get update && \
         xvfb \
         x11vnc \
         fluxbox \
+        novnc \
+        websockify \
         # OpenCV运行时依赖
         libgl1 \
         libglib2.0-0 \
@@ -124,12 +126,12 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN node --version && npm --version
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /app /app
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
-RUN playwright install chromium && \
-    playwright install-deps chromium
+RUN playwright install chromium
+
+COPY --from=builder /app /app
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
@@ -142,7 +144,7 @@ RUN echo "ulimit -c 0" >> /etc/profile
 # 在生产环境中，建议配置适当的用户映射
 
 # 暴露端口
-EXPOSE 8080
+EXPOSE 8080 5900 6080
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

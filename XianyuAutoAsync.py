@@ -863,6 +863,166 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注销实例失败: {self._safe_str(e)}")
 
+    async def _open_manual_verification_browser_legacy(self, target_url: str = None, wait_seconds: int = 300):
+        """Open a visible browser with current cookies so the user can finish risk-control verification."""
+        playwright = None
+        browser = None
+        target_url = target_url or "https://www.goofish.com/im"
+        wait_seconds = max(30, min(int(wait_seconds or 300), 600))
+
+        try:
+            from playwright.async_api import async_playwright
+
+            self.reconnect_blocked = False
+            self.reconnect_block_reason = ""
+            self.last_token_refresh_status = "needs_verification"
+            self.last_token_refresh_error = "请在 noVNC 打开的浏览器中完成闲鱼风控验证"
+            self._set_connection_state(
+                ConnectionState.VERIFYING,
+                "请在 noVNC 打开的浏览器中完成闲鱼风控验证",
+            )
+
+            playwright = await async_playwright().start()
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--window-size=1365,768',
+            ]
+            headless = not (os.name == 'nt' or bool(os.getenv('DISPLAY')))
+            if headless:
+                logger.warning(f"【{self.cookie_id}】当前环境没有 DISPLAY，将无法在 noVNC 显示验证浏览器")
+
+            browser = await playwright.chromium.launch(headless=headless, args=browser_args)
+            context = await browser.new_context(
+                viewport={'width': 1365, 'height': 768},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+            )
+
+            cookies = []
+            for name, value in self.cookies.items():
+                if not value:
+                    continue
+                for domain in ('.goofish.com', '.taobao.com', '.alibaba.com'):
+                    cookies.append({'name': str(name), 'value': str(value), 'domain': domain, 'path': '/'})
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                    logger.info(f"【{self.cookie_id}】已向手动验证浏览器注入 {len(cookies)} 个 cookie")
+                except Exception as cookie_error:
+                    logger.warning(f"【{self.cookie_id}】手动验证浏览器注入 cookie 失败: {self._safe_str(cookie_error)}")
+
+            page = await context.new_page()
+            logger.warning(f"【{self.cookie_id}】已打开手动风控验证浏览器: {target_url}")
+            try:
+                await page.goto(target_url, wait_until='domcontentloaded', timeout=30000)
+            except Exception as goto_error:
+                logger.warning(f"【{self.cookie_id}】打开验证页面超时或失败，浏览器仍保持打开: {self._safe_str(goto_error)}")
+
+            start_time = time.time()
+            while time.time() - start_time < wait_seconds:
+                await asyncio.sleep(3)
+
+            updated_cookies = await context.cookies()
+            if updated_cookies:
+                merged_cookies = self.cookies.copy()
+                for cookie in updated_cookies:
+                    name = cookie.get('name')
+                    value = cookie.get('value')
+                    if name and value:
+                        merged_cookies[name] = value
+                self.cookies = merged_cookies
+                self.cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies.items()])
+                await self.update_config_cookies()
+                logger.info(f"【{self.cookie_id}】手动验证浏览器已回收并保存 {len(updated_cookies)} 个 cookie")
+
+            self.last_token_refresh_status = "manual_verification_done"
+            self.last_token_refresh_error = ""
+            self.current_token = None
+            self.connection_failures = 0
+            self._set_connection_state(ConnectionState.RECONNECTING, "手动验证完成，正在重启账号任务")
+            await self._restart_instance()
+            return True
+        except Exception as e:
+            self.last_token_refresh_status = "captcha_exception"
+            self.last_token_refresh_error = self._safe_str(e)
+            self._set_connection_state(ConnectionState.FAILED, f"打开手动验证浏览器失败: {self._safe_str(e)}")
+            logger.error(f"【{self.cookie_id}】打开手动验证浏览器失败: {self._safe_str(e)}")
+            return False
+        finally:
+            try:
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
+            try:
+                if playwright:
+                    await playwright.stop()
+            except Exception:
+                pass
+
+    async def open_manual_verification_browser(self, target_url: str = None, wait_seconds: int = 300):
+        """Open manual risk-control verification with the stealth browser shown in noVNC."""
+        target_url = target_url or "https://www.goofish.com/im"
+        self.last_token_refresh_status = "manual_verification_opened"
+        self.last_token_refresh_error = "Waiting for manual verification in noVNC"
+        self.reconnect_blocked = True
+        self.reconnect_block_reason = "manual_verification"
+        self._set_connection_state(ConnectionState.VERIFYING, "等待在 noVNC 中完成人工风控验证")
+
+        try:
+            import concurrent.futures
+            from utils.xianyu_slider_stealth import XianyuSliderStealth
+
+            slider_stealth = XianyuSliderStealth(
+                user_id=str(self.cookie_id),
+                enable_learning=False,
+                headless=False,
+            )
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                success, updated_cookies = await loop.run_in_executor(
+                    executor,
+                    slider_stealth.run_manual,
+                    target_url,
+                    dict(self.cookies or {}),
+                    wait_seconds,
+                )
+
+            if not success:
+                self.last_token_refresh_status = "manual_verification_timeout"
+                self.last_token_refresh_error = "人工验证未完成，或被阿里异常流量页拦截"
+                self._set_connection_state(ConnectionState.VERIFYING, "人工验证未完成，请稍后重试")
+                logger.warning(f"【{self.cookie_id}】人工风控验证未完成或超时")
+                return False
+
+            if updated_cookies:
+                merged_cookies = dict(self.cookies or {})
+                merged_cookies.update(updated_cookies)
+                self.cookies = merged_cookies
+                self.cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies.items()])
+                await self.update_config_cookies()
+                logger.info(f"【{self.cookie_id}】人工验证完成，已保存 {len(updated_cookies)} 个Cookie")
+
+            self.last_token_refresh_status = "manual_verification_done"
+            self.last_token_refresh_error = ""
+            self.current_token = None
+            self.connection_failures = 0
+            self.reconnect_blocked = False
+            self.reconnect_block_reason = ""
+            self._set_connection_state(ConnectionState.RECONNECTING, "人工验证完成，正在重启账号任务")
+            await self._restart_instance()
+            return True
+        except Exception as e:
+            self.last_token_refresh_status = "captcha_exception"
+            self.last_token_refresh_error = self._safe_str(e)
+            self._set_connection_state(ConnectionState.FAILED, f"打开人工验证浏览器失败: {self._safe_str(e)}")
+            logger.error(f"【{self.cookie_id}】打开人工验证浏览器失败: {self._safe_str(e)}")
+            return False
+
     @classmethod
     def get_instance(cls, cookie_id: str):
         """获取指定cookie_id的XianyuLive实例"""
@@ -2510,10 +2670,17 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
+                novnc_enabled = str(os.getenv("ENABLE_NOVNC", "true")).lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                }
                 interactive_verification = (
                     os.name == "nt"
                     or bool(os.getenv("DISPLAY"))
-                ) and not os.getenv("DOCKER_ENV")
+                    or (bool(os.getenv("DOCKER_ENV")) and novnc_enabled)
+                )
                 if not interactive_verification:
                     self.reconnect_blocked = True
                     self.reconnect_block_reason = "当前运行环境无法打开人工风控验证窗口"
@@ -2915,6 +3082,19 @@ class XianyuLive:
             username = account_info.get('username', '')
             password = account_info.get('password', '')
             show_browser = account_info.get('show_browser', False)
+            force_headful_in_docker = (
+                bool(os.getenv("DOCKER_ENV"))
+                and bool(os.getenv("DISPLAY"))
+                and str(os.getenv("FORCE_HEADFUL_IN_DOCKER", "true")).lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                }
+            )
+            if force_headful_in_docker and not show_browser:
+                show_browser = True
+                logger.info(f"【{self.cookie_id}】Docker/noVNC环境已启用，密码登录强制使用有头浏览器")
             credential_fingerprint = hashlib.sha256(
                 f"{username}\0{password}".encode("utf-8")
             ).hexdigest()
@@ -7223,9 +7403,12 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            # 使用无头浏览器
+            browser_headless = not (os.name == 'nt' or bool(os.getenv('DISPLAY')))
+            if not browser_headless:
+                logger.info(f"【{target_cookie_id}】检测到可视化环境，扫码Cookie刷新将在 noVNC/桌面中显示浏览器")
+
             browser = await playwright.chromium.launch(
-                headless=True,  # 改回无头模式
+                headless=browser_headless,
                 args=browser_args
             )
 
@@ -7611,9 +7794,12 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            # 使用无头浏览器
+            browser_headless = not (os.name == 'nt' or bool(os.getenv('DISPLAY')))
+            if not browser_headless:
+                logger.info(f"【{self.cookie_id}】检测到可视化环境，Cookie页面刷新将在 noVNC/桌面中显示浏览器")
+
             browser = await playwright.chromium.launch(
-                headless=True,
+                headless=browser_headless,
                 args=browser_args
             )
 
@@ -7915,9 +8101,12 @@ class XianyuLive:
                     '--use-mock-keychain'
                 ])
 
-            # Cookie刷新模式使用无头浏览器
+            browser_headless = not (os.name == 'nt' or bool(os.getenv('DISPLAY')))
+            if not browser_headless:
+                logger.info(f"【{self.cookie_id}】检测到可视化环境，Cookie刷新将在 noVNC/桌面中显示浏览器")
+
             browser = await playwright.chromium.launch(
-                headless=True,
+                headless=browser_headless,
                 args=browser_args
             )
 

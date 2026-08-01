@@ -2,62 +2,87 @@ services:
   xianyu-app:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ${DOCKERFILE:-Dockerfile}
     image: xianyu-auto-reply:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
-    # 使用root用户避免权限问题
     user: "0:0"
+    shm_size: ${SHM_SIZE:-1gb}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "${WEB_PORT:-8080}:8080"
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-28080}:8080"
+      - "${NOVNC_BIND:-0.0.0.0}:${NOVNC_PORT:-26080}:6080"
+      - "${VNC_BIND:-127.0.0.1}:${VNC_PORT:-25900}:5900"
     volumes:
-      # 数据持久化
       - ./data:/app/data:rw
       - ./logs:/app/logs:rw
-      - ./global_config.yml:/app/global_config.yml:ro
-      # 可选：如果需要自定义配置
-      # - ./custom_config.yml:/app/global_config.yml:ro
-      # 可选：备份目录
       - ./backups:/app/backups:rw
+      - ./browser_data:/app/browser_data:rw
+      - ./global_config.yml:/app/global_config.yml:ro
     environment:
-      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
-      - PYTHONDONTWRITEBYTECODE=${PYTHONDONTWRITEBYTECODE:-1}
-      - TZ=${TZ:-Asia/Shanghai}
-      - DB_PATH=${DB_PATH:-/app/data/xianyu_data.db}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - DEBUG=${DEBUG:-false}
-      - RELOAD=${RELOAD:-false}
-      # SQL日志配置（默认启用，可通过环境变量覆盖）
-      - SQL_LOG_ENABLED=${SQL_LOG_ENABLED:-true}
-      - SQL_LOG_LEVEL=${SQL_LOG_LEVEL:-INFO}
-      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-default-secret-key}
-      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600}
-      # 多用户系统配置
-      - MULTIUSER_ENABLED=${MULTIUSER_ENABLED:-true}
-      - USER_REGISTRATION_ENABLED=${USER_REGISTRATION_ENABLED:-true}
-      - EMAIL_VERIFICATION_ENABLED=${EMAIL_VERIFICATION_ENABLED:-true}
-      - CAPTCHA_ENABLED=${CAPTCHA_ENABLED:-true}
-      - TOKEN_EXPIRE_TIME=${TOKEN_EXPIRE_TIME:-86400}
-      - AUTO_REPLY_ENABLED=${AUTO_REPLY_ENABLED:-true}
-      - AUTO_DELIVERY_ENABLED=${AUTO_DELIVERY_ENABLED:-true}
-      - AUTO_DELIVERY_TIMEOUT=${AUTO_DELIVERY_TIMEOUT:-30}
-      - API_CARD_TIMEOUT=${API_CARD_TIMEOUT:-10}
-      - BATCH_DATA_LOCK_TIMEOUT=${BATCH_DATA_LOCK_TIMEOUT:-5}
-      # AI回复相关配置
-      - AI_REPLY_ENABLED=${AI_REPLY_ENABLED:-false}
-      - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-qwen-plus}
-      - DEFAULT_AI_BASE_URL=${DEFAULT_AI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      - AI_REQUEST_TIMEOUT=${AI_REQUEST_TIMEOUT:-30}
-      - AI_MAX_TOKENS=${AI_MAX_TOKENS:-100}
-      - WEBSOCKET_URL=${WEBSOCKET_URL:-wss://wss-goofish.dingtalk.com/}
-      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-15}
-      - HEARTBEAT_TIMEOUT=${HEARTBEAT_TIMEOUT:-5}
-      - TOKEN_REFRESH_INTERVAL=${TOKEN_REFRESH_INTERVAL:-3600}
-      - TOKEN_RETRY_INTERVAL=${TOKEN_RETRY_INTERVAL:-300}
-      - MESSAGE_EXPIRE_TIME=${MESSAGE_EXPIRE_TIME:-300000}
+      PYTHONUNBUFFERED: ${PYTHONUNBUFFERED:-1}
+      PYTHONDONTWRITEBYTECODE: ${PYTHONDONTWRITEBYTECODE:-1}
+      TZ: ${TZ:-Asia/Shanghai}
+      DOCKER_ENV: "true"
 
+      API_HOST: 0.0.0.0
+      API_PORT: 8080
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: ${DEBUG:-false}
+      RELOAD: ${RELOAD:-false}
+      SQL_LOG_ENABLED: ${SQL_LOG_ENABLED:-true}
+      SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
+
+      DB_TYPE: ${DB_TYPE:-mysql}
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-xianyu_super_butler}
+      DB_USERNAME: ${DB_USERNAME:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-eq2*r34rwr4!}
+      DB_PATH: ${DB_PATH:-/app/data/xianyu_data.db}
+
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-jwt-secret}
+      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-3600}
+      MULTIUSER_ENABLED: ${MULTIUSER_ENABLED:-true}
+      USER_REGISTRATION_ENABLED: ${USER_REGISTRATION_ENABLED:-true}
+      EMAIL_VERIFICATION_ENABLED: ${EMAIL_VERIFICATION_ENABLED:-true}
+      CAPTCHA_ENABLED: ${CAPTCHA_ENABLED:-true}
+      TOKEN_EXPIRE_TIME: ${TOKEN_EXPIRE_TIME:-86400}
+
+      AUTO_REPLY_ENABLED: ${AUTO_REPLY_ENABLED:-true}
+      AUTO_DELIVERY_ENABLED: ${AUTO_DELIVERY_ENABLED:-true}
+      AUTO_DELIVERY_TIMEOUT: ${AUTO_DELIVERY_TIMEOUT:-30}
+      API_CARD_TIMEOUT: ${API_CARD_TIMEOUT:-10}
+      BATCH_DATA_LOCK_TIMEOUT: ${BATCH_DATA_LOCK_TIMEOUT:-5}
+
+      AI_REPLY_ENABLED: ${AI_REPLY_ENABLED:-false}
+      DEFAULT_AI_MODEL: ${DEFAULT_AI_MODEL:-qwen-plus}
+      DEFAULT_AI_BASE_URL: ${DEFAULT_AI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      AI_REQUEST_TIMEOUT: ${AI_REQUEST_TIMEOUT:-30}
+      AI_MAX_TOKENS: ${AI_MAX_TOKENS:-100}
+
+      WEBSOCKET_URL: ${WEBSOCKET_URL:-wss://wss-goofish.dingtalk.com/}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-15}
+      HEARTBEAT_TIMEOUT: ${HEARTBEAT_TIMEOUT:-5}
+      TOKEN_REFRESH_INTERVAL: ${TOKEN_REFRESH_INTERVAL:-3600}
+      TOKEN_RETRY_INTERVAL: ${TOKEN_RETRY_INTERVAL:-300}
+      MESSAGE_EXPIRE_TIME: ${MESSAGE_EXPIRE_TIME:-300000}
+
+      DISPLAY: ${DISPLAY:-:99}
+      ENABLE_NOVNC: ${ENABLE_NOVNC:-true}
+      FORCE_HEADFUL_IN_DOCKER: ${FORCE_HEADFUL_IN_DOCKER:-true}
+      VNC_PORT: 5900
+      NOVNC_PORT: 6080
+      NOVNC_PUBLIC_PORT: ${NOVNC_PUBLIC_PORT:-26080}
+      VNC_PASSWORD: ${VNC_PASSWORD:-xianyu}
+      SCREEN_WIDTH: ${SCREEN_WIDTH:-1365}
+      SCREEN_HEIGHT: ${SCREEN_HEIGHT:-768}
+      SCREEN_DEPTH: ${SCREEN_DEPTH:-24}
+      BROWSER_DATA_DIR: /app/browser_data
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
     networks:
       - xianyu-network
     healthcheck:
@@ -65,25 +90,25 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          memory: ${MEMORY_LIMIT:-2048}M
-          cpus: '${CPU_LIMIT:-2.0}'
-        reservations:
-          memory: ${MEMORY_RESERVATION:-512}M
-          cpus: '${CPU_RESERVATION:-0.5}'
+      start_period: 60s
+#    deploy:
+#      resources:
+#        limits:
+#          memory: ${MEMORY_LIMIT:-3072}M
+#          cpus: "${CPU_LIMIT:-2.0}"
+#        reservations:
+#          memory: ${MEMORY_RESERVATION:-512}M
+#          cpus: "${CPU_RESERVATION:-0.5}"
 
-  # 可选：添加Nginx反向代理
   nginx:
     image: nginx:alpine
     container_name: xianyu-nginx
     restart: unless-stopped
+    profiles:
+      - with-nginx
     ports:
-      - "80:80"
-      - "443:443"
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
@@ -91,15 +116,7 @@ services:
       - xianyu-app
     networks:
       - xianyu-network
-    profiles:
-      - with-nginx
 
 networks:
   xianyu-network:
     driver: bridge
-
-volumes:
-  xianyu-data:
-    driver: local
-  xianyu-logs:
-    driver: local
